@@ -1,6 +1,6 @@
 # Benchmark: what this machine can render
 
-First measured run and its follow-up, 2026-11-12. One clip (same image, prompt and seed throughout), a handful of configurations: not a full sweep.
+First measured run and its follow-ups, 2026-11-12. One subject (same portrait and seed throughout), a handful of configurations: not a full sweep.
 
 ## Machine
 
@@ -109,7 +109,73 @@ Input flattened onto white (see below) for the two FastWan runs; the baseline us
 ### Preview setting chosen
 
 `ti2v_2_2_fastwan`, 3 steps, guidance 1, flow shift 3, **profile 1**, input flattened on white.
-Final quality keeps the 30-step 5B (or the 14B, see P3).
+Final quality keeps the 30-step 5B (or the 14B, see below).
+
+## Keyframe interpolation: 14B I2V Lightning with an end frame
+
+Can the brief's FLF2V segment (start frame + end frame → clip) run on the 1080? One run.
+
+| Parameter       | Value                                                                     |
+| --------------- | ------------------------------------------------------------------------- |
+| Model           | `i2v_2_2_Enhanced_Lightning_v2`: Wan 2.2 I2V 14B, two experts (high noise, low noise), FP8 scaled, 14.3 GB each |
+| Mode            | image-to-video, `image_prompt_type` `SE` (start + end frame)              |
+| Start frame     | the portrait, alpha flattened on white, 480x510                           |
+| End frame       | last frame of the FastWan clip above, resized to 480x510 (white background, same subject) |
+| Output          | 608x656 (832x480 budget), 41 frames at 16 fps = **2.56 s**                |
+| Steps / CFG     | 4 / 1.0 (both experts), flow shift 5, seed 42, **profile 4**              |
+
+Settings and outputs: `outputs/p3/` (not tracked). Two Chrome tabs (Gmail, YouTube) were open
+during the run: the RAM figures include them, roughly 1-2 GB.
+
+| Phase                                         | Time                         |
+| --------------------------------------------- | ---------------------------- |
+| Model load (both experts + text encoder)      | ~8 min (files in OS cache from an earlier attempt; ~14 min cold, read from disk) |
+| Text encoding                                 | 1 min 30 s                   |
+| Denoising, 4 steps (2 high noise, 2 low noise)| 16 min 50 s (240, 221, 326, 223 s/step) |
+| VAE decode                                    | ~45 s                        |
+| **Total, launch to saved file**               | **27 min 36 s**              |
+
+| Memory (sampled every 2 s)          | Value                                                  |
+| ----------------------------------- | ------------------------------------------------------ |
+| VRAM during denoising               | 2.8 GB                                                 |
+| **VRAM peak** (VAE decode)          | **4.7 GB** of 8                                        |
+| System RAM idle (with Chrome)       | 8.9 GB                                                 |
+| RAM, high-noise expert              | 26.1 GB                                                |
+| **RAM peak** (low-noise expert)     | **32.6 GB** of 32: saturated, spilling into the page file |
+
+- **It works.** Pascal has no FP8 matmul; Wan2GP's PyTorch fallback dequantizes each layer on the
+  fly (`[FP8] Backend: PyTorch`, no Triton) with no extra setup.
+- **About 11 min of render per second of video**, the same rate as the 30-step 5B, for a 14B
+  with an end frame. A step costs ~4 min: ~5 times a FastWan step, as estimated (more tokens,
+  three times the parameters).
+- **RAM is the limit, not VRAM.** Profile 4 keeps both experts in RAM; once the low-noise expert
+  runs, RAM is full. The first low-noise step is the slowest (326 s), likely from paging. A first
+  attempt was killed from outside after 22 min (no Python error, RAM at 26 GB then). Not measured:
+  profile 5 (VeryLowRAM), which should trade RAM for load time.
+- **Loading is slow**: 28.6 GB of weights from `E:`, 8 to 14 minutes before the first step.
+  A backend that keeps the model loaded between segments (Wan2GP's `WanGPSession`) saves it.
+
+### Quality (all 41 frames compared, frames 0-6, 10, 20, 30, 40 looked at)
+
+- **Both ends are hit.** Frame 0 matches the start frame (mean pixel difference 1.7 on 255),
+  frame 40 the end frame (7.4). No cut: the motion is continuous throughout.
+- **The face morphs from one keyframe to the other**: the identity slides from the start
+  portrait to the FastWan end frame's narrower, older face. The interpolation follows the end
+  frame faithfully; keyframes must therefore share the same identity, since any drift in an end
+  frame ends up in the clip.
+- **Expression overshoots.** In between, the smile becomes a wide grin with teeth and squinted
+  eyes, then closes back onto the end frame. The motion asked for (smile, eyes closing, head
+  lowering) is there but exaggerated.
+- **Artefacts**: the start frame's residual alpha fringes vanish at frame 1 (a visible jump on
+  the background); a few dark specks appear on the white background mid-clip; the image looks
+  over-sharpened, like the FastWan clip.
+
+### Verdict
+
+**FLF2V is feasible on the 1080 but slow**: ~28 min per 2.5 s segment at 480p, with RAM at its
+limit. Fit for final renders of short keyframe segments run unattended (overnight queue),
+not for iteration; previews stay on FastWan 5B. Keyframes need a clean background (no alpha
+fringes) and one consistent identity.
 
 ## Recommendation
 
@@ -120,10 +186,8 @@ measured: 4 min 41 s per 2.5 s clip, the preview mode of the brief.
 **14B is needed anyway for keyframe interpolation**, because 5B cannot take an end frame.
 Not 14B GGUF though: Wan2GP ships GGUF presets only for LTX-2, none for Wan; it serves 14B
 as int8/fp8 checkpoints, which its offloading handles with the 32 GB of RAM.
-The candidate is *Wan 2.2 I2V Enhanced Lightning v2 14B* (4 steps, no CFG). Estimate, not
-measured: 14B uses the Wan 2.1 VAE, so ~4x more tokens than 5B at the same resolution and
-~3x more parameters, partly offset by 4 single-pass steps instead of 30 doubled by CFG:
-roughly 20-40 min per 2.5 s at 480p. Download: two experts of ~14 GB each, to approve first.
+*Wan 2.2 I2V Enhanced Lightning v2 14B* (4 steps, no CFG) is now measured (section above):
+27 min 36 s per 2.56 s segment, RAM saturated. Use it for keyframe segments only, queued.
 
 **ComfyUI: not yet.** Wan2GP already provides everything the brief expects from ComfyUI:
 headless runs (`wgp.py --process settings.json`), a Python API (`WanGPSession`) and an MCP
