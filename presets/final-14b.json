@@ -1,0 +1,19 @@
+{
+  "label": "Final: Wan 2.2 I2V 14B Lightning v2, 4 steps",
+  "tier": "final",
+  "end_frame": true,
+  "fps": 16,
+  "memory_profile": 5,
+  "style": "",
+  "loras": [],
+  "settings": {
+    "model_type": "i2v_2_2_Enhanced_Lightning_v2",
+    "resolution": "832x480",
+    "num_inference_steps": 4,
+    "guidance_scale": 1,
+    "guidance2_scale": 1,
+    "flow_shift": 5
+  },
+  "estimates": {"loading_model": 22, "encoding_text": 118, "inference_step": 286, "decoding": 45},
+  "notes": "Default final preset. Profile 5 measured in P5 (docs/benchmark.md): 22 min 10 s for 41 frames with an end frame, loads in 22 s. Start + end frame (FLF) or start only."
+}

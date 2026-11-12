@@ -1,0 +1,106 @@
+import pytest
+from fastapi.testclient import TestClient
+from PIL import Image
+
+from conftest import png_bytes, portrait
+from zoetrope import paths
+
+
+@pytest.fixture
+def client(outputs):
+    from zoetrope.api import app
+
+    return TestClient(app)
+
+
+def _job_with_keyframes(client, n=2, end_mode="exact"):
+    job = client.post("/api/jobs", json={"title": "t", "end_mode": end_mode}).json()
+    for pos in range(n):
+        if pos == 0:
+            img = portrait(color=(200, 120, 90))
+        else:
+            img = portrait(size=(140, 100), color=(120, 160, 220), offset=5)
+        r = client.post(f"/api/jobs/{job['id']}/keyframes", data={"position": pos},
+                        files={"file": (f"{pos}.png", png_bytes(img), "image/png")})
+        assert r.status_code == 201, r.text
+    return client.get(f"/api/jobs/{job['id']}").json()
+
+
+def test_segments_follow_keyframes(client):
+    job = _job_with_keyframes(client, n=1)
+    assert [(s["kf_in"], s["kf_out"]) for s in job["segments"]] == [(0, None)]
+    job = _job_with_keyframes(client, n=3, end_mode="guide")
+    segs = [(s["kf_in"], s["kf_out"], s["end_mode"]) for s in job["segments"]]
+    assert segs == [(0, 1, "exact"), (1, 2, "guide")]
+    assert job["keyframes"][1]["deviation"]["before"]["color"] > 0
+    assert job["keyframes"][0]["url"].startswith("/files/")
+
+
+def test_keyframe_position_must_be_contiguous(client):
+    job = client.post("/api/jobs", json={}).json()
+    r = client.post(f"/api/jobs/{job['id']}/keyframes", data={"position": 2},
+                    files={"file": ("a.png", png_bytes(portrait()), "image/png")})
+    assert r.status_code == 400
+
+
+def test_match_brings_keyframe_to_start_size_and_colours(client):
+    job = _job_with_keyframes(client)
+    kf = job["keyframes"][1]
+    r = client.post(f"/api/keyframes/{kf['id']}/match", json={})
+    assert r.status_code == 200, r.text
+    m = r.json()
+    assert m["match_applied"] == 1
+    assert m["deviation"]["after"]["color"] < m["deviation"]["before"]["color"]
+    start = Image.open(paths.keyframes_dir(job["id"]) / "0.png")
+    assert Image.open(paths.keyframes_dir(job["id"]) / "1.png").size == start.size
+    undo = client.post(f"/api/keyframes/{kf['id']}/match", json={"enabled": False}).json()
+    assert undo["match_applied"] == 0
+
+
+def test_takes_preview_final_cancel_replay_retain(client):
+    job = _job_with_keyframes(client)
+    seg = job["segments"][0]
+    no_prompt = client.post(f"/api/segments/{seg['id']}/takes", json={"tier": "preview"})
+    assert no_prompt.status_code == 400
+    client.patch(f"/api/segments/{seg['id']}", json={"prompt": "the man smiles", "duration_s": 2.5})
+
+    prev = client.post(f"/api/segments/{seg['id']}/takes", json={"tier": "preview", "seed": 42}).json()
+    assert prev["settings"]["image_prompt_type"] == "S"
+    assert prev["settings"]["model_type"] == "ti2v_2_2_fastwan"
+    assert prev["settings"]["video_length"] == 61 and prev["seed"] == 42
+
+    final = client.post(f"/api/segments/{seg['id']}/takes", json={"tier": "final"}).json()
+    s = final["settings"]
+    assert s["image_prompt_type"] == "SE" and s["video_length"] == 41
+    assert s["image_start"].endswith(f"{final['id']}_start.png")
+    assert s["image_end"].endswith(f"{final['id']}_end.png")
+    assert isinstance(final["seed"], int)
+
+    q = client.get("/api/queue").json()
+    assert [i["id"] for i in q["items"]] == [prev["id"], final["id"]]
+    assert q["worker"]["alive"] is False
+    assert client.get(f"/api/takes/{final['id']}").json()["remaining_s"] > 0
+
+    assert client.post(f"/api/takes/{prev['id']}/cancel").json()["status"] == "cancelled"
+    assert client.post(f"/api/takes/{prev['id']}/cancel").status_code == 400
+    again = client.post(f"/api/takes/{final['id']}/replay").json()
+    assert again["seed"] == final["seed"] and again["settings"] == final["settings"]
+
+    assert client.put(f"/api/segments/{seg['id']}/retained", json={"take_id": final["id"]}).status_code == 400
+    assert client.post(f"/api/jobs/{job['id']}/assemblies", json={}).status_code == 400
+
+
+def test_guide_mode_and_5b_preset(client):
+    job = _job_with_keyframes(client, end_mode="guide")
+    seg = job["segments"][0]
+    client.patch(f"/api/segments/{seg['id']}", json={"prompt": "smile"})
+    t = client.post(f"/api/segments/{seg['id']}/takes", json={"tier": "final"}).json()
+    assert t["settings"]["image_prompt_type"] == "S"
+    client.patch(f"/api/jobs/{job['id']}", json={"end_mode": "exact", "preset_final": "final-5b"})
+    r = client.post(f"/api/segments/{seg['id']}/takes", json={"tier": "final"})
+    assert r.status_code == 400 and "end frame" in r.json()["detail"]
+
+
+def test_presets_endpoint(client):
+    names = [p["name"] for p in client.get("/api/presets").json()]
+    assert "final-14b" in names

@@ -1,0 +1,183 @@
+"""HTTP API. Light, own venv, restartable without touching a render: it only reads and writes the
+SQLite base, the worker does the rendering. The front polls it (no WebSocket).
+
+Run: `.venv/Scripts/python -m uvicorn zoetrope.api:app --port 8765` (see scripts/start-api.ps1).
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Iterator
+
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from . import db, paths, presets, service
+
+app = FastAPI(title="Zoetrope")
+
+
+def get_conn() -> Iterator[sqlite3.Connection]:
+    conn = db.connect()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@app.exception_handler(service.NotFound)
+async def _not_found(_request, exc):
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(service.Invalid)
+async def _invalid(_request, exc):
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+Conn = Depends(get_conn)
+
+
+# --- bodies -------------------------------------------------------------------------------------
+
+
+class JobIn(BaseModel):
+    title: str = ""
+    preset_final: str = presets.DEFAULT_FINAL
+    end_mode: str = "exact"
+
+
+class JobPatch(BaseModel):
+    title: str | None = None
+    preset_final: str | None = None
+    end_mode: str | None = None
+
+
+class MatchIn(BaseModel):
+    enabled: bool = True
+    color_match: bool = True
+    remove_fringes: bool = True
+    background: str = "#ffffff"
+
+
+class SegmentPatch(BaseModel):
+    prompt: str | None = None
+    duration_s: float | None = None
+
+
+class TakeIn(BaseModel):
+    tier: str = "preview"
+    seed: int | None = None
+    preset: str | None = None
+
+
+class RetainIn(BaseModel):
+    take_id: int | None
+
+
+class AssemblyIn(BaseModel):
+    color_match: bool = True
+    fps_mode: str = "native"
+
+
+# --- routes -------------------------------------------------------------------------------------
+
+
+@app.get("/api/presets")
+def list_presets():
+    return [p.public() for p in presets.list_presets()]
+
+
+@app.get("/api/jobs")
+def list_jobs(conn=Conn):
+    return service.list_jobs(conn)
+
+
+@app.post("/api/jobs", status_code=201)
+def create_job(body: JobIn, conn=Conn):
+    job = service.create_job(conn, body.title, body.preset_final, body.end_mode)
+    return service.job_detail(conn, job["id"])
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: int, conn=Conn):
+    return service.job_detail(conn, job_id)
+
+
+@app.patch("/api/jobs/{job_id}")
+def patch_job(job_id: int, body: JobPatch, conn=Conn):
+    service.update_job(conn, job_id, **body.model_dump())
+    return service.job_detail(conn, job_id)
+
+
+@app.post("/api/jobs/{job_id}/keyframes", status_code=201)
+async def upload_keyframe(job_id: int, position: int = Form(...), file: UploadFile = File(...), conn=Conn):
+    if position < 0:
+        raise HTTPException(400, "position must be >= 0")
+    return service.add_keyframe(conn, job_id, position, await file.read())
+
+
+@app.post("/api/keyframes/{keyframe_id}/match")
+def match_keyframe(keyframe_id: int, body: MatchIn, conn=Conn):
+    return service.match_keyframe(conn, keyframe_id, **body.model_dump())
+
+
+@app.delete("/api/keyframes/{keyframe_id}", status_code=204)
+def delete_keyframe(keyframe_id: int, conn=Conn):
+    service.delete_keyframe(conn, keyframe_id)
+
+
+@app.patch("/api/segments/{segment_id}")
+def patch_segment(segment_id: int, body: SegmentPatch, conn=Conn):
+    return service.update_segment(conn, segment_id, **body.model_dump())
+
+
+@app.post("/api/segments/{segment_id}/takes", status_code=201)
+def create_take(segment_id: int, body: TakeIn, conn=Conn):
+    return service.create_take(conn, segment_id, body.tier, seed=body.seed, preset=body.preset)
+
+
+@app.put("/api/segments/{segment_id}/retained")
+def retain(segment_id: int, body: RetainIn, conn=Conn):
+    return service.retain_take(conn, segment_id, body.take_id)
+
+
+@app.get("/api/takes/{take_id}")
+def get_take(take_id: int, conn=Conn):
+    return service.get_take(conn, take_id)
+
+
+@app.post("/api/takes/{take_id}/replay", status_code=201)
+def replay_take(take_id: int, conn=Conn):
+    return service.replay_take(conn, take_id)
+
+
+@app.post("/api/takes/{take_id}/cancel")
+def cancel_take(take_id: int, conn=Conn):
+    return service.cancel(conn, "take", take_id)
+
+
+@app.post("/api/jobs/{job_id}/assemblies", status_code=201)
+def create_assembly(job_id: int, body: AssemblyIn, conn=Conn):
+    return service.create_assembly(conn, job_id, color_match=body.color_match, fps_mode=body.fps_mode)
+
+
+@app.post("/api/assemblies/{assembly_id}/cancel")
+def cancel_assembly(assembly_id: int, conn=Conn):
+    return service.cancel(conn, "assembly", assembly_id)
+
+
+@app.get("/api/queue")
+def get_queue(conn=Conn):
+    return service.queue_state(conn)
+
+
+@app.get("/api/worker")
+def get_worker(conn=Conn):
+    return service.worker_state(conn)
+
+
+paths.jobs_dir().mkdir(parents=True, exist_ok=True)
+app.mount("/files", StaticFiles(directory=paths.jobs_dir(), check_dir=False), name="files")

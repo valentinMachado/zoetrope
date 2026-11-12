@@ -177,17 +177,80 @@ limit. Fit for final renders of short keyframe segments run unattended (overnigh
 not for iteration; previews stay on FastWan 5B. Keyframes need a clean background (no alpha
 fringes) and one consistent identity.
 
+## 14B memory profile, start-only clip, RIFE x2
+
+Measured for the backend's final preset, in one `WanGPSession` (the API the worker uses), so the
+second run found the model loaded. Same inputs, prompt and seed as the FLF run above, 41 frames
+at 16 fps, 4 steps. Scripts and outputs: `outputs/p5/` (not tracked). No browser open.
+
+| Run                                   | Load    | Text + VAE encode | Steps (s)            | Decode | **Total** |
+| ------------------------------------- | ------- | ----------------- | -------------------- | ------ | --------- |
+| FLF, profile 4 (P3, above)            | ~8 min  | 1 min 30 s        | 240, 221, 326, 223   | ~45 s  | 27 min 36 s |
+| **FLF, profile 5**                    | **22 s**| 1 min 32 s + 26 s | 316, 219, 383, 226   | 45 s   | **22 min 10 s** |
+| Start frame only, profile 5           | none (loaded) | cached + 25 s | 322, 206, 283, 227 | 41 s   | 18 min 27 s |
+| RIFE x2 on the 41-frame FLF clip      | ~2 s    |                   |                      |        | **21 s**  |
+
+- **The profile changes memory, not the result**: the profile 5 FLF clip is identical to the
+  profile 4 one, pixel for pixel (mean difference 0.0).
+- **Profile 5 loads in 22 s instead of 8 to 14 min**: it maps the weights and streams them from
+  disk at each step instead of pinning them in RAM first. Denoising is ~2 min slower (19 min
+  against 17), the first low-noise step slowest (383 s).
+- **RAM is still full, but differently.** The `used` column reaches 32.5 GB of 32 again, and
+  only ~250 MB stayed available during the low-noise expert, with ~60 MB/s read back from disk.
+  Yet the Wan2GP process held only 6.4 GB of private memory: the rest of its 23.6 GB working set
+  is file-mapped weights, which Windows can drop and re-read, where profile 4's pinned RAM is
+  private and spills to the page file. Other programs suffer while it runs (a 3-second test
+  suite took 50 s). VRAM peak 4.9 GB.
+- **Start frame only costs the same as FLF** per step; the 18 min 27 s above skip the text
+  encoding (same prompt, cached). Count ~20 min for a 2.5 s single-image clip.
+- **RIFE x2 is cheap**: 21 s for 41 to 81 frames, model download (`rife4.26.pkl`, small)
+  and load included. Fine as a queued step of the assembly.
+
+Quality of the start-only clip (frames 0, 10, 20, 30, 40): identity holds far better than with
+the FastWan end frame (no slide toward the narrower face), but the motion departs from the
+prompt: a laugh with squeezed eyes from frame 10 on, no head lowering, and the start image's
+coloured fringes and dark specks stay on the background throughout. The user's verdict on the
+three 14B clips of this portrait: **the start-only one drifts least and is the best**; a FastWan
+frame as end keyframe pulls the identity away.
+
+**Choice: profile 5 for the `final-14b` preset.** Loading in seconds matters more than 2 min of
+denoising, since previews (5B, profile 1) between finals force the 14B to reload, and RAM
+pressure no longer goes to the page file.
+
+### Through the backend's queue
+
+First renders submitted through the API and run by the worker, same portrait (the original
+RGBA cut-out as start image, prepared by the backend: alpha flattened on white, matte choked by
+2 px), same prompt and seed 42:
+
+- Preview (FastWan 5B, profile 1, 61 frames): 10 min 14 s, of which 5 min 38 s loading after
+  the measurements above had filled RAM (P2: 4 min 41 s in all). **No jump at frame 1** any
+  more: the frame 0 to 1 difference (5.3) equals the next ones (5.1), where P3's start image,
+  flattened without fringe removal, jumped.
+- Final (14B, profile 5, FLF to the FastWan end frame after the backend's technical match:
+  fitted to the start image's size, colours histogram-matched, colour deviation 12.0 to 0.2):
+  **19 min 55 s** (load 20 s, prompt encoding cached from the preview, 4 steps in 18 min 22 s,
+  decode 44 s). Both ends are hit (frame 0 against the start image 1.3, frame 40 against the end
+  keyframe 8.0) and the face morphs as in P3. **New defect: at frame 1 the whole white background
+  turns light grey** (frame 0 to 1 difference 13.6, then ~5) and stays grey, with a thin blue line
+  along the bottom edge late in the clip. The fringe jump is gone; this one is the 14B not
+  holding pure white (255). Not addressed yet.
+- Assembly of that take at x2 (RIFE through the worker, colour match on): 11 s, 81 frames at
+  32 fps.
+
 ## Recommendation
 
-**Keep 5B as the default model for single-image clips and previews.** It fits comfortably
-(5.7 GB VRAM, 24 GB RAM) and its quality on this test is good. FastWan (3 steps) is now
-measured: 4 min 41 s per 2.5 s clip, the preview mode of the brief.
+**5B for previews.** It fits comfortably (5.7 GB VRAM, 24 GB RAM). FastWan (3 steps): 4 min
+41 s per 2.5 s clip, the preview mode of the brief. The 30-step 5B stays available as an optional
+final preset (`final-5b`), not the default: finals all go to the 14B so the queue never has to
+switch final models.
 
 **14B is needed anyway for keyframe interpolation**, because 5B cannot take an end frame.
 Not 14B GGUF though: Wan2GP ships GGUF presets only for LTX-2, none for Wan; it serves 14B
 as int8/fp8 checkpoints, which its offloading handles with the 32 GB of RAM.
 *Wan 2.2 I2V Enhanced Lightning v2 14B* (4 steps, no CFG) is now measured (section above):
-27 min 36 s per 2.56 s segment, RAM saturated. Use it for keyframe segments only, queued.
+27 min 36 s per 2.56 s segment, RAM saturated; 22 min 10 s with profile 5 (section above).
+The backend uses it for every final render, queued (preset `final-14b`).
 
 **ComfyUI: not yet.** Wan2GP already provides everything the brief expects from ComfyUI:
 headless runs (`wgp.py --process settings.json`), a Python API (`WanGPSession`) and an MCP
