@@ -1,6 +1,6 @@
 # Benchmark: what this machine can render
 
-First measured run, 2026-11-12. One clip, one configuration: a baseline, not a sweep.
+First measured run and its follow-up, 2026-11-12. One clip (same image, prompt and seed throughout), a handful of configurations: not a full sweep.
 
 ## Machine
 
@@ -64,18 +64,58 @@ Rule of thumb: **~12 min of render per second of 480p video** at 30 steps.
   artefacts. Flatten alpha onto a solid colour before submitting: a preprocessing step for
   the backend.
 - **VRAM is underused during denoising** (2 GB of 8): profile 4 streams weights from RAM.
-  A less aggressive profile or `--preload` may shorten each step; untested.
+  A less aggressive profile does not shorten the step, only load and decode (see the next section).
 - **TI2V-5B has no end-frame input in Wan2GP** (`image_prompt_types_allowed = "TSVL"`, no
   `E`). The brief's keyframe + FLF2V approach needs Wan 2.2 I2V 14B (`SEVL`) or Wan 2.1
   FLF2V 14B.
 - Windows Smart App Control blocked numba's unsigned DLL; it had to be turned off.
 
+## Speeding up the 5B (no 5B-sized download)
+
+Same prompt, seed 42, 832x480 budget, 61 frames. The only download was the FastWan LoRA
+(661 MB, fetched by Wan2GP into `tools/Wan2GP/loras/wan_5B/`). Memory sampled every 2 s as above.
+Input flattened onto white (see below) for the two FastWan runs; the baseline used the raw PNG.
+
+| Run                                  | Steps / CFG | s/step | Total (launch to file) | VRAM peak | RAM peak |
+| ------------------------------------ | ----------- | ------ | ---------------------- | --------- | -------- |
+| Baseline: 5B, profile 4              | 30 / 5.0    | 51.8   | 29 min 44 s            | 5.7 GB    | 24.1 GB  |
+| FastWan 5B, profile 4                | 3 / 1.0     | 27.9   | 6 min 26 s             | 5.6 GB    | 23.9 GB  |
+| **FastWan 5B, profile 1**            | 3 / 1.0     | 27.9   | **4 min 41 s**         | 7.0 GB    | 24.6 GB  |
+
+- **FastWan is the big win**: 3 steps with no CFG pass, 4.6x faster than the baseline with
+  profile 4 (6.4x with profile 1). A 2.5 s clip in under 5 minutes, about 1.8 min of render per
+  second of video.
+- **The step time does not depend on the profile** (27.9 s either way, and 51.8 s is almost exactly
+  two passes of it): the 5B denoising is compute-bound on the 1080, not weight-streaming-bound.
+  Profile 1 saves time only on model load and VAE decode (about 2 min), at the price of 1.4 GB more
+  VRAM (7.0 of 8 GB peak: little headroom if the desktop takes more than ~0.9 GB).
+- **VAE decode is now the biggest single cost** (about 3 min of the 4.7), longer than the three
+  denoising steps (1 min 24 s).
+- `--preload` was not run separately: profile 1 already preloads as many layers as fit.
+- Not measured: a 30-step 5B run with profile 1 (the step-time result above says it would gain
+  the same ~2 min of 30).
+
+### Quality (frames 0, 20, 40, 60 of both clips)
+
+- **Transparency**: flattening the alpha onto white removes the black/artefacted background; the
+  output background stays clean white, as the prompt asks. Do it in the backend, before submission.
+- **FastWan drifts more than the 30-step baseline.** The face narrows and looks older and more
+  wrinkled from frame 20 on, the mouth stays closed at the smile's peak (the baseline shows teeth),
+  the eyes stay shut longer, and a white shirt collar appears. Motion is smooth, no flicker.
+  Identity is recognisable but not faithful: fine to judge a prompt, not to deliver.
+- The two FastWan files differ by a few bytes between profile 4 and profile 1 (not compared
+  frame by frame); the frames looked at are from the profile 4 clip.
+
+### Preview setting chosen
+
+`ti2v_2_2_fastwan`, 3 steps, guidance 1, flow shift 3, **profile 1**, input flattened on white.
+Final quality keeps the 30-step 5B (or the 14B, see P3).
+
 ## Recommendation
 
 **Keep 5B as the default model for single-image clips and previews.** It fits comfortably
-(5.7 GB VRAM, 24 GB RAM) and its quality on this test is good. To try next, at no download
-cost: the FastWan LoRA (3 steps, built into Wan2GP), which should bring a 2.5 s clip from
-30 min to a few minutes and could become the preview mode of the brief.
+(5.7 GB VRAM, 24 GB RAM) and its quality on this test is good. FastWan (3 steps) is now
+measured: 4 min 41 s per 2.5 s clip, the preview mode of the brief.
 
 **14B is needed anyway for keyframe interpolation**, because 5B cannot take an end frame.
 Not 14B GGUF though: Wan2GP ships GGUF presets only for LTX-2, none for Wan; it serves 14B
