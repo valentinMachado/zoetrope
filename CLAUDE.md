@@ -60,9 +60,11 @@ docstrings (`queue.py`, `service.py`, `worker.py`, `images.py`, `assembly.py`).
 py -m uv sync                                   # API venv + dev tools
 .venv\Scripts\python -m pytest                  # tests
 .venv\Scripts\python -m ruff check src tests    # lint
-scripts\start-api.ps1                           # API and front on http://127.0.0.1:8765
-scripts\start-worker.ps1                        # worker, detached; log in outputs\worker.log
-scripts\stop-worker.ps1 [-Force]                # stop after the current task, or kill
+scripts\start.ps1                               # API + worker, both detached; safe to rerun, prints the state
+scripts\stop.ps1 [-Force]                       # stop both (worker after its current task, or kill)
+scripts\start-api.ps1                           # API alone, foreground (dev); front on http://127.0.0.1:8765
+scripts\start-worker.ps1                        # worker alone, detached; log in outputs\worker.log
+scripts\stop-worker.ps1 [-Force]                # worker alone: stop after the current task, or kill
 ```
 
 ## Machine constraints
