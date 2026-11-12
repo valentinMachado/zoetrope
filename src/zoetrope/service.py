@@ -10,6 +10,8 @@ position, technical match applied; older keygens stay listed and `use_keygen` pu
 Segment i goes from keyframe i to keyframe i+1 and is kept in sync with the keyframes: internal
 segments are `exact` (their end frame is sent to the model), the last one takes the job's end
 mode (`exact` or `guide`; in guide mode its end keyframe only serves to judge the preview).
+A prompt being written gets the instant rules of zoetrope.prompt_review (`check_prompt`) and, on
+request, an AI review queued for the worker (`create_review`), given its context as text.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 
-from . import db, images, paths, presets
+from . import db, images, paths, presets, prompt_review
 from . import queue as task_queue
 
 WORKER_ALIVE_S = 20.0
@@ -134,6 +136,8 @@ def job_detail(conn: sqlite3.Connection, job_id: int) -> dict[str, Any]:
         "SELECT * FROM assembly WHERE job_id = ? ORDER BY id", (job_id,)).fetchall())]
     job["keygens"] = [public_keygen(k) for k in db.rows(conn.execute(
         "SELECT * FROM keygen WHERE job_id = ? ORDER BY id", (job_id,)).fetchall())]
+    job["reviews"] = [public_review(r) for r in db.rows(conn.execute(
+        "SELECT * FROM review WHERE job_id = ? ORDER BY id", (job_id,)).fetchall())]
     return job
 
 
@@ -407,6 +411,86 @@ def public_keygen(g: dict[str, Any]) -> dict[str, Any]:
     return g
 
 
+# --- prompt reviews (zoetrope.prompt_review) ----------------------------------------------------
+
+
+def _created_from(conn: sqlite3.Connection, job_id: int, position: int) -> str | None:
+    """The prompt the keyframe at `position` was created with, if a keygen made it."""
+    r = conn.execute("SELECT g.instruction FROM keyframe k JOIN keygen g ON g.id = k.source_keygen_id "
+                     "WHERE k.job_id = ? AND k.position = ?", (job_id, position)).fetchone()
+    return r[0] if r and r[0] else None
+
+
+def review_context(conn: sqlite3.Connection, job_id: int, target: str, *, segment_id: int | None = None,
+                   position: int | None = None, sources: list[int | str] = (),
+                   duration_s: float | None = None) -> prompt_review.Context:
+    """What the review knows besides the text. Motion: the segment's duration (or `duration_s`,
+    not saved yet) and end image. Image: the target position and the kinds of its `sources`
+    (keyframe positions, or "upload"). Both: the prompts the images involved were created with,
+    which often name their style and subject (the AI does not see the images)."""
+    _get(conn, "job", job_id)
+    if target == "motion":
+        if segment_id is None:
+            raise Invalid("A motion prompt review needs its segment")
+        seg = _get(conn, "segment", segment_id)
+        if seg["job_id"] != job_id:
+            raise Invalid("That segment belongs to another job")
+        end = None if seg["kf_out"] is None else seg["end_mode"]
+        notes = []
+        made = _created_from(conn, job_id, seg["kf_in"])
+        if made:
+            notes.append("The start image of this shot was created by an image model from this prompt "
+                         f"(it tells its style and subject): \"{made}\"")
+        made = _created_from(conn, job_id, seg["kf_out"]) if seg["kf_out"] is not None else None
+        if made:
+            notes.append(f"The end image was created from this prompt: \"{made}\"")
+        return prompt_review.Context("motion", duration_s=duration_s or seg["duration_s"], end_image=end,
+                                     notes=tuple(notes))
+    if target != "image":
+        raise Invalid(f"target must be one of {', '.join(prompt_review.TARGETS)}")
+    kinds, notes = [], []
+    for src in sources:
+        if src == "upload":
+            kinds.append("upload")
+            continue
+        kinds.append("start" if int(src) == 0 else "keyframe")
+        made = _created_from(conn, job_id, int(src))
+        if made:
+            notes.append(f"Source image {len(kinds)} was created from this prompt: \"{made}\"")
+    if not sources and position != 0:
+        made = _created_from(conn, job_id, 0)
+        if made:
+            notes.append(f"The start image of the video was created from this prompt: \"{made}\"")
+    return prompt_review.Context("image", position=position if position is not None else 0,
+                                 sources=tuple(kinds), notes=tuple(notes))
+
+
+def check_prompt(conn: sqlite3.Connection, job_id: int, target: str, text: str, **where: Any) -> list[dict[str, Any]]:
+    """The instant rules on a prompt being written; `where` as for review_context."""
+    return prompt_review.check(text, review_context(conn, job_id, target, **where))
+
+
+def create_review(conn: sqlite3.Connection, job_id: int, target: str, text: str, **where: Any) -> dict[str, Any]:
+    """Queue the AI review of a prompt; context and rule findings are snapshotted."""
+    ctx = review_context(conn, job_id, target, **where)
+    if not text.strip():
+        raise Invalid("Write a prompt first")
+    cur = conn.execute(
+        "INSERT INTO review (job_id, target, segment_id, position, text, context, findings, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+        (job_id, target, where.get("segment_id"), ctx.position, text.strip(), json.dumps(ctx.to_json()),
+         json.dumps(prompt_review.check(text, ctx)), db.now()),
+    )
+    return public_review(_get(conn, "review", cur.lastrowid))
+
+
+def public_review(r: dict[str, Any]) -> dict[str, Any]:
+    r = dict(r)
+    for key, default in (("context", {}), ("findings", []), ("result", None), ("durations", None)):
+        r[key] = db.loads(r[key], default)
+    return r
+
+
 # --- segments -----------------------------------------------------------------------------------
 
 
@@ -542,7 +626,8 @@ def cancel(conn: sqlite3.Connection, table: str, row_id: int) -> dict[str, Any]:
         else:
             raise Invalid(f"{table} {row_id} is already {r['status']}")
     r = _get(conn, table, row_id)
-    return {"take": public_take, "keygen": public_keygen, "assembly": public_assembly}[table](r)
+    public = {"take": public_take, "keygen": public_keygen, "assembly": public_assembly, "review": public_review}
+    return public[table](r)
 
 
 def get_take(conn: sqlite3.Connection, take_id: int) -> dict[str, Any]:
@@ -624,6 +709,11 @@ def queue_state(conn: sqlite3.Connection) -> dict[str, Any]:
         elif item["kind"] == "keygen":
             item.update(job_id=r["job_id"], position=r["position"], tier="keyframe", preset=r["preset"],
                         phase=r["phase"], step=r["step"], total_steps=r["total_steps"], progress=r["progress"])
+        elif item["kind"] == "review":
+            idx = None
+            if r["segment_id"] is not None:
+                idx = conn.execute("SELECT idx FROM segment WHERE id = ?", (r["segment_id"],)).fetchone()[0]
+            item.update(job_id=r["job_id"], target=r["target"], segment_idx=idx, phase=r["phase"])
         else:
             item.update(job_id=r["job_id"], phase=r["phase"])
     return {"worker": worker_state(conn), **snap}

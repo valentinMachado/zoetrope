@@ -8,6 +8,9 @@
 // The job page follows the user's path in five steps (STEPS): start image, preview, final render,
 // keep a take, assembly. nextStep() reads the job's state and says what to do now; the button that
 // does it is outlined (data-next / .is-next).
+//
+// Every prompt field (a shot's motion, an image to create) lists the rule findings as the user
+// types and offers an AI review that proposes a corrected version (P12, « prompt review » below).
 "use strict";
 
 const POLL_ACTIVE_MS = 2000;
@@ -275,7 +278,8 @@ function renderTopbar(error) {
   const q = state.queue;
   if (w.alive) {
     const cur = w.current_kind
-      ? ({ take: `rend la prise #${w.current_id}`, keygen: `crée une image (création #${w.current_id})` }[w.current_kind] ||
+      ? ({ take: `rend la prise #${w.current_id}`, keygen: `crée une image (création #${w.current_id})`,
+        review: "relit un prompt" }[w.current_kind] ||
         `monte (montage ${w.current_id})`)
       : "prêt, rien à faire";
     pill.className = "pill ok";
@@ -308,7 +312,9 @@ function renderQueuePanel() {
   const rows = state.queue.items.map((i) => {
     const what = i.kind === "take"
       ? `plan ${i.segment_idx + 1} · ${TIER_LABELS[i.tier] || i.tier} (prise #${i.id})`
-      : i.kind === "keygen" ? `création de l'${posName(i.position)} (#${i.id})` : `montage ${i.id}`;
+      : i.kind === "keygen" ? `création de l'${posName(i.position)} (#${i.id})`
+        : i.kind === "review" ? `relecture IA du prompt ${i.target === "motion" ? `du plan ${i.segment_idx + 1}` : "d'image"}`
+          : `montage ${i.id}`;
     let where = "";
     if (i.status === "running") {
       where = PHASE_LABELS[i.phase] || i.phase || "démarrage";
@@ -331,7 +337,7 @@ function renderQueuePanel() {
     rows.length ? h("ol", {}, rows) : h("p", {}, "Rien en attente."),
     rows.length ? h("p", { class: "muted" }, `Tout sera fini dans ${fmtDuration(state.queue.total_s)} environ.`) : null,
     h("p", { class: "muted small" },
-      "Ordre : les aperçus et les images créées d'abord, puis les montages, puis les rendus finaux regroupés par modèle " +
+      "Ordre : les relectures de prompt, puis les aperçus et les images créées, puis les montages, puis les rendus finaux regroupés par modèle " +
       "(changer de modèle le recharge). Tu peux fermer la page : les rendus continuent."),
   );
   panel.scrollTop = top;
@@ -773,13 +779,16 @@ function openCompare(job, k) {
 // Folded « Conseils » under a text field: what worked in the measures (docs/benchmark.md: P8 for
 // the keygen prompt; P9 notes for the motion prompt), plus examples that fill the field.
 
+// Put a text in a prompt field as if typed: its listeners save it (segment) or keep it (keygen draft).
+function fillField(field, text) {
+  field.value = text;
+  field.dispatchEvent(new Event("input"));
+  field.dispatchEvent(new Event("change"));
+  field.focus();
+}
+
 function promptTips(key, field, tips, examples) {
-  const use = (text) => {
-    field.value = text;
-    field.dispatchEvent(new Event("input"));
-    field.dispatchEvent(new Event("change"));
-    field.focus();
-  };
+  const use = (text) => fillField(field, text);
   return fold(`tips-${key}`, "adv", "Conseils pour bien l'écrire",
     h("ul", { class: "tips" }, tips.map((t) => h("li", {}, t))),
     h("div", { class: "tips-examples" }, h("span", { class: "muted" }, "Exemples (clic pour reprendre) :"),
@@ -824,6 +833,111 @@ const KEYGEN_EXAMPLES = [
   "Turn this photo into a watercolor painting, loose wet brushstrokes, white paper.",
   "A watercolor portrait of an old fisherman with a grey beard, facing the viewer, plain white background.",
 ];
+
+// --- prompt review (P12) ------------------------------------------------------------------------
+//
+// Two levels (zoetrope/prompt_review.py): instant rules, checked by the API as the user types and
+// listed under the field; and on request an AI review (Qwen3 4B, a short task at the head of the
+// queue) that rewrites the prompt to fix them, which the user takes or not. The AI does not see
+// the images: it knows the duration, the end image and the prompts the images were created with.
+
+const REVIEW_ESTIMATE = "~15 s";
+
+const CHECK_TEXT = {
+  empty: (_f, t) => t === "motion" ? "Prompt vide : décris ce qui bouge."
+    : "Prompt vide : décris toute l'image, ou ajoute une image source.",
+  french: () => "En français : les modèles suivent mieux l'anglais (la relecture IA le traduit).",
+  short: (f, t) => `Très court (${f.words} mot${f.words > 1 ? "s" : ""}) : ` +
+    (t === "motion" ? "dis le sujet, ce qui bouge, la caméra et le style." : "dis le sujet, le cadrage, le fond et le style."),
+  no_style: (_f, t) => "Le style n'est pas nommé (« a watercolor painting… », « a pencil drawing… », « a photo… ») : " +
+    (t === "motion" ? "sans ça, une aquarelle ou un dessin vire vite à la photo." : "sans ça, le modèle choisit."),
+  no_camera: () => "La caméra n'est pas dite (« static camera », « slow push-in ») : sans ça, elle bouge souvent toute seule.",
+  too_many_actions: (f) => `${f.actions} actions à la suite pour ${f.duration_s ?? "?"} s : ${f.max} au plus tiennent ` +
+    "dans un plan. Pour une suite d'actions, ajoute des images et des plans.",
+  negation: () => "Une négation (« no », « without », « sans »…) : les modèles la suivent mal, dis plutôt ce que tu veux voir.",
+};
+
+// Rule findings under a field, refreshed as the user types. `body()` gives the prompt and where
+// it is (as POST /prompt-check takes it). Returns the list element and a function that re-runs it.
+function promptChecks(job, field, body) {
+  const box = h("ul", { class: "checks" });
+  let timer = null;
+  let asked = 0;
+  const run = async () => {
+    const b = body();
+    const n = ++asked;
+    try {
+      const r = await api("POST", `/jobs/${job.id}/prompt-check`, b);
+      if (n !== asked) return; // a newer check is on its way
+      box.replaceChildren(...(r.findings.length
+        ? r.findings.map((f) => h("li", {}, (CHECK_TEXT[f.code] || (() => f.code))(f, b.target)))
+        : (b.text.trim() ? [h("li", { class: "ok" }, "Rien à redire selon les règles simples.")] : [])));
+    } catch (_) { /* the API is down: the top bar says so */ }
+  };
+  field.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(run, 400); });
+  run();
+  return { box, run };
+}
+
+// « Relire avec l'IA »: `beforeSend` may save the field first (a segment's prompt).
+function reviewButton(job, body, beforeSend = async () => true) {
+  return h("button", { type: "button", title: "Un modèle de langue local (Qwen3 4B) relit le prompt et propose " +
+    "une version corrigée. Il passe en tête de la file.", onclick: async () => {
+    const b = body();
+    if (!b.text.trim()) { toast("Écris d'abord un prompt."); return; }
+    if (!(await beforeSend())) return;
+    await act(() => api("POST", `/jobs/${job.id}/reviews`, b));
+  } }, `Relire avec l'IA (${REVIEW_ESTIMATE})`);
+}
+
+const dismissedReviews = new Set();
+
+function latestReview(job, match) {
+  const r = job.reviews.filter(match).at(-1);
+  return r && r.status !== "cancelled" && !dismissedReviews.has(r.id) ? r : null;
+}
+
+// Fill `box` with the review `r` (or nothing), rebuilt only when it changes.
+function syncReview(box, r, field) {
+  const q = r ? queueItem("review", r.id) : null;
+  const sig = JSON.stringify(r ? [r.id, r.status, r.phase, r.result, r.error, q ? Math.round(q.starts_in_s / 5) : 0] : null);
+  if (box.dataset.sig === sig) return;
+  box.dataset.sig = sig;
+  box.replaceChildren(...(r ? [renderReview(r, field, q)] : []));
+}
+
+function renderReview(r, field, q) {
+  const cancel = h("button", { type: "button", class: "danger",
+    onclick: () => act(() => api("POST", `/reviews/${r.id}/cancel`)) }, r.cancel_requested ? "annulation…" : "Annuler");
+  const close = h("button", { type: "button", title: "Masquer cette relecture",
+    onclick: () => { dismissedReviews.add(r.id); refreshNow(); } }, "Fermer");
+  const head = h("div", { class: "review-head" }, h("strong", {}, "Relecture IA"),
+    h("span", { class: "muted small" }, ` de « ${r.text} »`), h("span", { class: "spacer" }),
+    isLive(r) ? cancel : close);
+  let body;
+  if (r.status === "queued") {
+    body = h("p", { class: "muted" }, q ? `En file : commence dans ${fmtDuration(q.starts_in_s)} environ.` : "En file.");
+  } else if (r.status === "running") {
+    body = h("p", { class: "muted" }, r.phase === "inference" ? "Le modèle écrit…" : "Chargement du modèle…");
+  } else if (r.status === "failed") {
+    body = h("pre", { class: "error" }, r.error || "échec");
+  } else {
+    const res = r.result || { issues: [], suggestion: "" };
+    const placeholder = res.suggestion.includes("[style]");
+    body = [
+      res.issues.length ? [h("p", { class: "small" }, "Autres remarques :"),
+        h("ul", { class: "checks" }, res.issues.map((t) => h("li", {}, t)))] : null,
+      res.suggestion ? h("blockquote", { class: "suggestion" }, res.suggestion) : h("p", { class: "muted" }, "Pas de proposition."),
+      placeholder ? h("p", { class: "muted small" }, "Remplace [style] par le style de l'image " +
+        "(« A watercolor painting of… », « A pencil drawing of… »…) : l'IA ne voit pas l'image.") : null,
+      res.suggestion ? h("div", { class: "row" },
+        h("button", { type: "button", class: "primary", title: "Remplace le prompt par cette version",
+          onclick: () => fillField(field, res.suggestion) }, "Utiliser cette version"),
+        r.durations ? h("span", { class: "muted small" }, `relu en ${fmtDuration(r.durations.total)}`) : null) : null,
+    ];
+  }
+  return h("div", { class: `review ${r.status}` }, head, body);
+}
 
 // --- keygens: an image created by Flux 2 Klein ----------------------------------------------------
 //
@@ -883,6 +997,9 @@ function renderKeygenForm(job) {
       ASPECTS.map(([v, label]) => h("option", { value: v, selected: v === d.aspect }, label))));
   const sourcesBox = h("div", { class: "keygen-sources" });
   const notes = h("div", { class: "keygen-notes" });
+  const promptBody = () => ({ target: "image", text: d.instruction, position: d.target,
+    sources: d.sources.map((s) => (s.file ? { upload: 0 } : { keyframe: s.keyframe })) });
+  const checks = promptChecks(job, instruction, promptBody);
 
   const addFile = (file) => {
     if (d.sources.length >= KEYGEN_SOURCES_MAX) { toast(`${KEYGEN_SOURCES_MAX} images source au plus.`); return; }
@@ -942,6 +1059,7 @@ function renderKeygenForm(job) {
         (hasTakes(job) ? " Les prises déjà faites restent, mais partent de l'ancienne." : ""));
     }
     notes.replaceChildren(...lines.map((t) => h("p", { class: "warn-note" }, t)));
+    checks.run(); // an edit or a text-only image is checked differently
   }
 
   const go = async () => {
@@ -978,6 +1096,9 @@ function renderKeygenForm(job) {
         h("button", { type: "button", class: "primary", onclick: go },
           `Créer l'image${est ? ` (~${fmtDuration(est)})` : ""}`))),
     notes,
+    checks.box,
+    h("div", { class: "row" }, reviewButton(job, promptBody)),
+    h("div", { class: "review-box" }),
     promptTips(`keygen-${job.id}`, instruction, KEYGEN_TIPS, KEYGEN_EXAMPLES),
   ];
 }
@@ -1050,6 +1171,9 @@ function openKeygenCompare(g) {
 function updateKeygens(view, job) {
   syncOne(view.querySelector(".keygen-form"), JSON.stringify([job.id, job.keyframes.map((k) => [k.position, k.version]),
     hasTakes(job), state.presets.length]), renderKeygenForm);
+  const form = view.querySelector(".keygen-form");
+  syncReview(form.querySelector(".review-box"), latestReview(job, (r) => r.target === "image"),
+    form.querySelector("textarea.prompt"));
   syncList(view.querySelector(".keygen-list"), [...job.keygens].reverse(), (g) => g.id, (g) => {
     const q = queueItem("keygen", g.id);
     return JSON.stringify([g.status, g.phase, g.step, g.progress, g.preview_url, g.output_url, g.error,
@@ -1106,6 +1230,10 @@ function renderSegment(job, s) {
   prompt.addEventListener("change", save);
   duration.addEventListener("change", save);
   duration.addEventListener("input", showFrames);
+  const promptBody = () => ({ target: "motion", text: prompt.value, segment_id: s.id,
+    duration_s: Number(duration.value) || null });
+  const checks = promptChecks(job, prompt, promptBody);
+  duration.addEventListener("change", checks.run);
   const launch = async (tier) => {
     if (!(await save())) return;
     const body = { tier };
@@ -1132,6 +1260,9 @@ function renderSegment(job, s) {
         thumb(kout, s.kf_out === null ? "fin libre" : s.end_mode === "guide" ? "fin indicative" : "fin")),
       h("div", { class: "seg-form" },
         h("label", {}, "Que se passe-t-il ? (prompt)", prompt),
+        checks.box,
+        h("div", { class: "row" }, reviewButton(job, promptBody, save)),
+        h("div", { class: "review-box" }),
         promptTips(`seg-${s.id}`, prompt, MOTION_TIPS, MOTION_EXAMPLES),
         h("div", { class: "row" },
           h("label", { class: "inline" }, "Durée (s)", duration),
@@ -1171,6 +1302,7 @@ function updateSegment(job, s) {
   const duration = card.querySelector(".duration");
   if (document.activeElement !== prompt && prompt.value !== s.prompt) prompt.value = s.prompt;
   if (document.activeElement !== duration && Number(duration.value) !== s.duration_s) duration.value = s.duration_s;
+  syncReview(card.querySelector(".review-box"), latestReview(job, (r) => r.segment_id === s.id), prompt);
   const takes = [...s.takes].reverse();
   const box = card.querySelector(".takes");
   syncList(box, takes, (t) => t.id, (t) => {

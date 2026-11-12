@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PRESETS_DIR = ROOT / "presets"
 LORAS_DIR = ROOT / "loras"
 WAN2GP_DIR = ROOT / "tools" / "Wan2GP"
+QWEN3_DIR = ROOT / "models" / "Qwen3"  # Flux 2 Klein's text encoder, also the prompt reviewer (P12)
 FRONT_DIR = Path(__file__).resolve().parent / "front"
 
 

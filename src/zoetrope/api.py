@@ -80,6 +80,24 @@ class RetainIn(BaseModel):
     take_id: int | None
 
 
+class PromptIn(BaseModel):
+    """A prompt and where it is: a segment's motion prompt, or an image prompt with its target
+    position and sources ({"keyframe": n} or {"upload": i}, as for a keygen)."""
+
+    target: str
+    text: str = ""
+    segment_id: int | None = None
+    duration_s: float | None = None
+    position: int | None = None
+    sources: list[dict[str, int]] = []
+
+    def where(self) -> dict:
+        if self.target == "motion":
+            return {"segment_id": self.segment_id, "duration_s": self.duration_s}
+        return {"position": self.position,
+                "sources": [s["keyframe"] if "keyframe" in s else "upload" for s in self.sources]}
+
+
 class AssemblyIn(BaseModel):
     color_match: bool = True
     fps_mode: str = "native"
@@ -160,6 +178,21 @@ def use_keygen(gen_id: int, conn=Conn):
 @app.post("/api/keygens/{gen_id}/cancel")
 def cancel_keygen(gen_id: int, conn=Conn):
     return service.cancel(conn, "keygen", gen_id)
+
+
+@app.post("/api/jobs/{job_id}/prompt-check")
+def check_prompt(job_id: int, body: PromptIn, conn=Conn):
+    return {"findings": service.check_prompt(conn, job_id, body.target, body.text, **body.where())}
+
+
+@app.post("/api/jobs/{job_id}/reviews", status_code=201)
+def create_review(job_id: int, body: PromptIn, conn=Conn):
+    return service.create_review(conn, job_id, body.target, body.text, **body.where())
+
+
+@app.post("/api/reviews/{review_id}/cancel")
+def cancel_review(review_id: int, conn=Conn):
+    return service.cancel(conn, "review", review_id)
 
 
 @app.patch("/api/segments/{segment_id}")

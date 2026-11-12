@@ -6,7 +6,9 @@ writes progress at each Wan2GP event (phase, step, last preview image, log tail,
 durations), honours cancel_requested, and keeps a heartbeat. Image creations (keygens, Flux 2
 Klein: a keyframe or the start image) run like takes, in the same session: loading Klein unloads
 the video model. A finished keygen's image becomes the image at its position (service.use_keygen). Assemblies run
-in the same queue (CPU, plus RIFE on the GPU for fps x2).
+in the same queue (CPU, plus RIFE on the GPU for fps x2). Prompt reviews load Qwen3 4B beside the
+session for one reply and free it (zoetrope.prompt_review.Reviewer); when the free VRAM is short,
+the session's model is released first (reloaded by the next take).
 
 Start it detached with scripts/start-worker.ps1, stop it with scripts/stop-worker.ps1 (a stop file,
 read between tasks; -Force kills it). After a crash, a take left running goes back to the queue;
@@ -33,7 +35,7 @@ from typing import Any
 from PIL import Image
 
 from . import assembly as assembly_mod
-from . import db, paths, service
+from . import db, paths, prompt_review, service
 from . import queue as task_queue
 
 log = logging.getLogger("zoetrope.worker")
@@ -63,10 +65,30 @@ def make_wan2gp_session() -> Any:
     return init(root=wan, output_dir=out, cli_args=["--attention", "sdpa"], console_output=False)
 
 
+def make_reviewer() -> Any:
+    """The prompt reviewer; it loads its model with Wan2GP's mmgp, hence Wan2GP on sys.path."""
+    if str(paths.WAN2GP_DIR) not in sys.path:
+        sys.path.insert(0, str(paths.WAN2GP_DIR))
+    return prompt_review.Reviewer(paths.QWEN3_DIR)
+
+
+def cuda_free_bytes() -> float:
+    """VRAM this process can still use: free on the card plus what torch holds in its cache."""
+    import torch
+
+    free = torch.cuda.mem_get_info()[0]
+    return float(free + torch.cuda.memory_reserved() - torch.cuda.memory_allocated())
+
+
 class Worker:
-    def __init__(self, conn: sqlite3.Connection, session_factory: Callable[[], Any] = make_wan2gp_session):
+    def __init__(self, conn: sqlite3.Connection, session_factory: Callable[[], Any] = make_wan2gp_session,
+                 reviewer_factory: Callable[[], Any] = make_reviewer,
+                 free_vram: Callable[[], float] = cuda_free_bytes):
         self.conn = conn
         self.session_factory = session_factory
+        self.reviewer_factory = reviewer_factory
+        self.free_vram = free_vram
+        self.reviewer: Any = None
         self.session: Any = None
         self.loaded: tuple[str, float] | None = None
         self.current: tuple[str, int] | None = None
@@ -78,7 +100,7 @@ class Worker:
     def recover(self) -> None:
         """Tasks left running by a dead worker go back to the queue, or fail on a second crash."""
         with db.transaction(self.conn):
-            for table in ("take", "keygen", "assembly"):
+            for table in ("take", "keygen", "assembly", "review"):
                 for r in self.conn.execute(f"SELECT id, interruptions, cancel_requested FROM {table} "
                                            "WHERE status = 'running'").fetchall():
                     n = r["interruptions"] + 1
@@ -154,6 +176,8 @@ class Worker:
                 self.run_take(task.row)
             elif task.kind == "keygen":
                 self.run_keygen(task.row)
+            elif task.kind == "review":
+                self.run_review(task.row)
             else:
                 self.run_assembly(task.row)
         finally:
@@ -244,6 +268,40 @@ class Worker:
     def _cancel_requested(self, table: str, row_id: int) -> bool:
         r = self.conn.execute(f"SELECT cancel_requested FROM {table} WHERE id = ?", (row_id,)).fetchone()
         return bool(r and r[0])
+
+    # --- prompt reviews ---------------------------------------------------------------------
+
+    def run_review(self, r: dict[str, Any]) -> None:
+        rid = r["id"]
+        ctx = prompt_review.Context.from_json(json.loads(r["context"]))
+        try:
+            if self.reviewer is None:
+                self.reviewer = self.reviewer_factory()
+            self._make_room(self.reviewer.VRAM_NEEDED)
+            out = self.reviewer.review(r["text"], ctx, should_stop=lambda: self._cancel_requested("review", rid),
+                                       on_phase=lambda p: db.update(self.conn, "review", rid, phase=p))
+        except Exception as e:  # noqa: BLE001 - a failed review never stops the worker
+            log.exception("review %d failed", rid)
+            db.update(self.conn, "review", rid, status="failed", finished_at=db.now(), phase=None,
+                      error=f"{type(e).__name__}: {e}"[:4000])
+            return
+        if self._cancel_requested("review", rid):
+            db.update(self.conn, "review", rid, status="cancelled", finished_at=db.now(), phase=None)
+            return
+        durations = out.pop("durations", None)
+        db.update(self.conn, "review", rid, status="done", finished_at=db.now(), phase=None,
+                  result=json.dumps(out), durations=json.dumps(durations) if durations else None)
+        log.info("review %d done", rid)
+
+    def _make_room(self, needed: float) -> None:
+        """Release the session's model when the free VRAM is below `needed` bytes."""
+        if self.session is None or self.loaded is None:
+            return
+        free = self.free_vram()
+        if free < needed:
+            log.info("%.1f GiB of VRAM free: releasing %s", free / 2**30, self.loaded)
+            self.session.close()
+            self.loaded = None
 
     # --- assemblies -------------------------------------------------------------------------
 

@@ -49,10 +49,14 @@ job, the start image included, can also be created by Flux 2 Klein from a prompt
 three source images (job images or uploaded files): a "keygen", a task of the worker's queue,
 preset `keyframe-klein`. Only an edit of the start image keeps its identity. The job page
 follows the user's path in five steps and says what to do next from the job's state
-(`nextStep()` in `app.js`); fine settings sit in folded « Avancé » blocks.
+(`nextStep()` in `app.js`); fine settings sit in folded « Avancé » blocks. Every prompt field
+lists instant rule findings as the user types, and offers an AI review (Qwen3 4B, Klein's text
+encoder, a `review` task at the head of the queue) that proposes a corrected prompt
+(`prompt_review.py`).
 
-Queue order, take/keygen/assembly lifecycle and keyframe preparation are documented in the module
-docstrings (`queue.py`, `service.py`, `worker.py`, `images.py`, `assembly.py`).
+Queue order, take/keygen/review/assembly lifecycle and keyframe preparation are documented in the
+module docstrings (`queue.py`, `service.py`, `worker.py`, `prompt_review.py`, `images.py`,
+`assembly.py`).
 
 ## Commands
 

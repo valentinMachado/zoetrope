@@ -351,6 +351,50 @@ the start image included). Checked once on job 6, through Zoetrope, seeds 11 and
   illustration from frame 20 (the P9 style problem, not specific to a generated start). 9 min
   including the switch from Klein to the 5B.
 
+## Prompt review: Qwen3 4B (P12)
+
+The text encoder of Flux 2 Klein (`models/Qwen3`, Qwen3 4B, int8 quanto, 36 layers, tied
+embeddings) is a complete causal LM: used as a local prompt reviewer, nothing to download. Loaded
+with mmgp's `fast_load_transformers_model`; the int8 weights refuse an fp32 cast, so activations
+run in bf16 (slow on Pascal, fine for a short reply). Greedy decoding, thinking off.
+
+| | |
+|---|---|
+| Load (from disk, to GPU) | 3.3-3.6 s |
+| VRAM | 4.86 GiB loaded, 4.96 GiB peak |
+| Speed | ~4.5 tokens/s (prompt of ~200-900 tokens) |
+| One review | 10-15 s with the final format (24-60 tokens), 25-30 s with a long critique |
+
+Quality, four prompts (job 4's French prompt with the start's keygen prompt as context, a good
+English prompt, "cat jumps", a French edit instruction), three formats tried:
+
+1. **Free critique + rewrite** (list what is missing, then a corrected prompt): the rewrite is
+   fair, the list generic and often wrong (three problems found in a prompt that has none, "no
+   action" for "cat jumps"), French clumsy.
+2. **Same with one worked example**: the model copies the example's points onto every prompt
+   ("in French" for "cat jumps"), invents a style ("cartoon") and details ("wings spread wide" on
+   a cat), drops meaning ("raises her eyelashes" for a wink).
+3. **Kept: the rules first, the model rewrites.** Instant rules (`zoetrope/prompt_review.py`:
+   language, style named, camera said, actions for the duration, negation, length) are given to
+   the model as certain findings; it rewrites the prompt to fix them only, keeps every action of
+   the author, writes `[style]` when the style is not known, and adds another problem only if it
+   sees one. The good prompt comes back unchanged with "rien"; "cat jumps" becomes "[style] cat
+   jumps high into the air, landing gracefully on its feet. Static camera."; the edit instruction
+   becomes "Make her close her eyes and turn her head slightly to the left." Left: the gender can
+   be wrong when the context does not give it ("A man" for job 4's face), and the model sometimes
+   keeps `[style]` next to the style it names (cleaned after the reply).
+
+The list of what is missing is therefore the rules' (reliable, instant); the AI's value is the
+rewrite.
+
+Through the queue (job 4, right after FastWan preview take #9, the 5B left loaded in RAM and not
+released: VRAM sufficed): review #1, job 4's French motion prompt, 57 s, of which 45 s loading
+(the Qwen file had left the disk cache under the 5B's RAM use) and 12 s writing; reply "[style]
+of a face. It smiles, then winks, and transforms into a multitude of butterflies flying in all
+directions. Static camera." (three actions kept despite the check). Review #2 right after, an image
+edit "elle ferme les yeux et sourit": 9.4 s (4 s load), "Make her close her eyes and smile." It does not see the images: a vision model (Qwen3.5-4B VL in Wan2GP, 4.8 + 0.67 GB to
+download) would, not measured.
+
 ## Recommendation
 
 **5B for previews.** It fits comfortably (5.7 GB VRAM, 24 GB RAM). FastWan (3 steps): 4 min

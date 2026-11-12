@@ -1,8 +1,9 @@
 """Queue order and time estimates, shared by the worker (what to run next) and the API (what the
 front shows).
 
-Order: previews and keyframe generations (keygens, ~40 s, the user waits for them) first, FIFO
-among them; then assemblies (short, the user is waiting for them);
+Order: prompt reviews first (~15 s, the user is reading the prompt), FIFO; then previews and
+keyframe generations (keygens, ~40 s, the user waits for them), FIFO among them; then assemblies
+(short, the user is waiting for them);
 then final renders grouped by loaded model (model type + memory profile, since changing either
 reloads the model), the group already loaded first, then the others by their oldest take, FIFO
 inside a group.
@@ -24,11 +25,19 @@ MODEL_TASKS = ("take", "keygen")  # tasks that run a Wan2GP model; their tables 
 PHASES = ("loading_model", "encoding_text", "inference", "decoding")
 ASSEMBLY_ESTIMATE_S = 30.0
 RIFE_X2_ESTIMATE_S = 30.0  # P5: 21 s for 41 frames, model load included
+REVIEW_ESTIMATE_S = 15.0  # P12: Qwen3 4B, 10-15 s load included
+OTHER_ESTIMATES = {"assembly": ASSEMBLY_ESTIMATE_S, "review": REVIEW_ESTIMATE_S}
+
+
+def other_estimate(task: Task) -> float:
+    """Seconds for a task that runs no Wan2GP model: an assembly or a review."""
+    extra = RIFE_X2_ESTIMATE_S if task.kind == "assembly" and task.row["fps_mode"] == "x2" else 0
+    return OTHER_ESTIMATES[task.kind] + extra
 
 
 @dataclass(frozen=True)
 class Task:
-    kind: str  # "take", "keygen" or "assembly"
+    kind: str  # "take", "keygen", "assembly" or "review"
     id: int
     row: dict[str, Any]
 
@@ -55,7 +64,9 @@ def pending(conn: sqlite3.Connection, loaded: tuple[str, float] | None) -> list[
     for t in finals:
         groups.setdefault(t.group, []).append(t)
     ordered = sorted(groups.items(), key=lambda kv: (kv[0] != loaded, kv[1][0].id))
-    return previews + assemblies + [t for _, ts in ordered for t in ts]
+    reviews = [Task("review", r["id"], r) for r in db.rows(conn.execute(
+        "SELECT * FROM review WHERE status = 'queued' ORDER BY id").fetchall())]
+    return reviews + previews + assemblies + [t for _, ts in ordered for t in ts]
 
 
 def next_task(conn: sqlite3.Connection, loaded: tuple[str, float] | None) -> Task | None:
@@ -139,16 +150,17 @@ def snapshot(conn: sqlite3.Connection, now: float) -> dict[str, Any]:
     clock = 0.0
     running = [(kind, t) for kind in MODEL_TASKS
                for t in db.rows(conn.execute(f"SELECT * FROM {kind} WHERE status = 'running'").fetchall())]
-    running_asm = db.rows(conn.execute("SELECT * FROM assembly WHERE status = 'running'").fetchall())
+    running_other = [Task(kind, r["id"], r) for kind in ("assembly", "review")
+                     for r in db.rows(conn.execute(f"SELECT * FROM {kind} WHERE status = 'running'").fetchall())]
     for kind, t in running:
         group = (t["model_type"], float(t["memory_profile"]))
         left = take_remaining(est_for(kind, t["preset"]), t, now, needs_load=group != loaded)
         items.append({"kind": kind, "id": t["id"], "status": "running", "starts_in_s": 0, "remaining_s": left})
         clock += left
         loaded = group
-    for a in running_asm:
-        left = ASSEMBLY_ESTIMATE_S + (RIFE_X2_ESTIMATE_S if a["fps_mode"] == "x2" else 0)
-        items.append({"kind": "assembly", "id": a["id"], "status": "running", "starts_in_s": 0, "remaining_s": left})
+    for task in running_other:
+        left = max(0.0, other_estimate(task) - (now - (task.row["started_at"] or now)))
+        items.append({"kind": task.kind, "id": task.id, "status": "running", "starts_in_s": 0, "remaining_s": left})
         clock += left
     for task in pending(conn, loaded):
         if task.kind in MODEL_TASKS:
@@ -156,7 +168,7 @@ def snapshot(conn: sqlite3.Connection, now: float) -> dict[str, Any]:
             dur = take_total_estimate(est_for(task.kind, task.row["preset"]), task.row, needs_load)
             loaded = task.group
         else:
-            dur = ASSEMBLY_ESTIMATE_S + (RIFE_X2_ESTIMATE_S if task.row["fps_mode"] == "x2" else 0)
+            dur = other_estimate(task)
         items.append({"kind": task.kind, "id": task.id, "status": "queued", "starts_in_s": clock, "remaining_s": dur})
         clock += dur
     return {"items": items, "total_s": clock}
