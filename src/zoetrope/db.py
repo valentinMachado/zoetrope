@@ -11,7 +11,8 @@ source images): its result replaces the keyframe at its position, which then rec
 in `source_keygen_id`. A review is the AI reading of a prompt (zoetrope.prompt_review): a motion
 prompt (`segment_id`) or an image prompt (`position`), with its context and rule findings
 snapshotted, and the AI's reply in `result`. A job's status is derived from its renders (takes,
-keygens, assemblies), never stored.
+keygens, assemblies), never stored. A job's `style` names the look of its images ("a watercolor
+painting, loose wet brushstrokes..."); takes and images from text alone get it in their prompt.
 """
 
 from __future__ import annotations
@@ -32,7 +33,8 @@ CREATE TABLE IF NOT EXISTS job (
     title         TEXT NOT NULL DEFAULT '',
     created_at    REAL NOT NULL,
     preset_final  TEXT NOT NULL,
-    end_mode      TEXT NOT NULL DEFAULT 'exact' CHECK (end_mode IN ('exact', 'guide'))
+    end_mode      TEXT NOT NULL DEFAULT 'exact' CHECK (end_mode IN ('exact', 'guide')),
+    style         TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS keyframe (
@@ -183,6 +185,7 @@ CREATE INDEX IF NOT EXISTS review_status ON review (status);
 # Columns added after a table was first created: CREATE TABLE IF NOT EXISTS leaves an existing
 # table alone, so they are added here when missing.
 MIGRATIONS = {
+    "job": {"style": "TEXT NOT NULL DEFAULT ''"},
     "keyframe": {"source_keygen_id": "INTEGER"},
     "keygen": {"sources": "TEXT"},
 }

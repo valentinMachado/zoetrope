@@ -395,6 +395,58 @@ directions. Static camera." (three actions kept despite the check). Review #2 ri
 edit "elle ferme les yeux et sourit": 9.4 s (4 s load), "Make her close her eyes and smile." It does not see the images: a vision model (Qwen3.5-4B VL in Wan2GP, 4.8 + 0.67 GB to
 download) would, not measured.
 
+## Holding a painted style (P9)
+
+The problem seen in P7 and P11: on FastWan previews a watercolour turns into a smooth, made-up,
+"illustration" face. Measured on two start images, job 4's half-abstract watercolour face
+(`AQUARELLE-FACILE`, 544x736) and job 6's generated red-haired watercolour portrait, each with its
+English prompt that names the style and the same seed, 2.5 s. Run outside the worker with a
+bench script on `WanGPSession` (clips in `outputs/p9`, not tracked).
+
+| Run | Setting | Time (2.5 s) | Style |
+|---|---|---|---|
+| A | FastWan 5B, 3 steps (the preview) | 3 min 15 s | lost at frame 4 |
+| B | A + negative prompt through NAG (scale 11, tau 2.5, alpha 0.25) | 3 min 14 s | lost at frame 4 |
+| D | 14B Lightning, start only, 41 frames, profile 5 | 22 min 12-22 s | kept |
+| DN | D + the same negative through NAG | 24 min 3 s | kept, barely different from D |
+| P | D at 400x560 (resolution "640x352") | 12 min 36 s | kept, less detail |
+
+Times include the model load when it was cold (D, DN, P: 14B; B on job 4: 9 min with the 5B
+load).
+
+- **The 5B cut is at frame 4**, the first latent it generates (its VAE packs 4 frames per
+  latent): TI2V only takes the start image as latent 0 and redraws the rest in its own look.
+  Frame 0 is the watercolour, frame 4 another, glossy face with lipstick (job 4); on job 6 the
+  same face with saturated, shiny hair and pink cheeks. Structural: no prompt fixes it.
+- **NAG** (Wan2GP applies a negative prompt at CFG 1 through Normalized Attention Guidance; the
+  flag that hides it on the 5B is UI only, the settings reach the model): the frames change
+  (mean gap 7-28 levels to A) but the cut stays. On the 14B, a little more pigment texture on the
+  skin; the user: "not much better". Not added to the presets.
+- **The 14B keeps the style** on both images: same paper, same blots, same face, no cut; job 6
+  smiles and tilts her head with the watercolour intact. What it still does, as the user put it on
+  job 4: when the face moves it must draw what the half-abstract painting does not show (an ear,
+  the face's outline, the smile's modelling) and draws it with "too much outline and shading", a
+  photorealistic face under the paint; a butterfly from the prompt comes out photorealistic.
+- **LoRA**: none for a watercolour style exists for Wan (5B or 14B I2V) on Civitai or Hugging Face
+  (searched by base model; the only 5B I2V "splash" LoRA is a water-balloon effect). The brief's
+  next step would be training one (style LoRA on stills, not doable on this GPU).
+
+**A painted end image bounds it.** Through Zoetrope, on job 4 (project style set, prompt "She
+slowly smiles, then winks. Static camera.", 2.5 s): end keyframe created by Klein from the start
+("Make her smile widely.", 3 min 10 s with a cold load) keeps the watercolour, its smiling face a
+little more outlined than the start; the 14B FLF to it (take #10, 24 min 11 s, same seed) keeps
+the watercolour from start to end, and the moving face is more painted than D's (washes and paper
+on the skin at frame 16, where D models a face). The wink came out as both eyes closing.
+With the project style set, the AI review of "elle sourit lentement puis fait un clin d'oeil"
+gave "A woman smiles slowly then winks. Static camera." (style not repeated, 18 s).
+
+**Consequences** (P9): the preview stays FastWan, the front says it does not keep a painted
+style (it judges motion and timing; the 14B final keeps the style), and for a painting an end
+image created by Klein from the start is the way to hold the style through the move. A job has a **style** field
+(`job.style`), put in front of every motion prompt and of an image created from text alone (an
+edit keeps its source's style); the prompt rules stop asking for a style when it is set, and the
+AI review is told it is added.
+
 ## Recommendation
 
 **5B for previews.** It fits comfortably (5.7 GB VRAM, 24 GB RAM). FastWan (3 steps): 4 min
@@ -414,6 +466,10 @@ instruction (~40 s at 512) keeps the start's identity through the 14B FLF, where
 pulls it away (section above). Wired into the backend and front as "create an image from the
 start" (preset `keyframe-klein`), widened in P11 to an image generator (text and/or up to three
 source images, the start image as a possible target).
+
+**Painted images**: the 14B keeps a watercolour, FastWan does not (cut at frame 4); an end
+image made by Klein from the start keeps it through the whole move (section above). No style
+LoRA exists for Wan; training one is the brief's last resort.
 
 **ComfyUI: not yet.** Wan2GP already provides everything the brief expects from ComfyUI:
 headless runs (`wgp.py --process settings.json`), a Python API (`WanGPSession`) and an MCP

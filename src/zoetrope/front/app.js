@@ -572,7 +572,7 @@ function renderJob() {
     app.replaceChildren(view);
   }
   syncOne(view.querySelector(".job-head"), JSON.stringify([job.title, job.preset_final, job.end_mode, job.status,
-    job.keyframes.length, state.presets.length]), renderJobHead);
+    job.keyframes.length, state.presets.length, job.style]), renderJobHead);
   const next = nextStep(job);
   syncOne(view.querySelector(".stepper-box"), JSON.stringify(stepsDone(job)), renderStepper);
   syncOne(view.querySelector(".next-box"), JSON.stringify([next, state.queue.worker.alive]), renderNext);
@@ -583,7 +583,7 @@ function renderJob() {
   updateKeygens(view, job);
   syncList(view.querySelector(".segments"), job.segments, (s) => s.id,
     (s) => JSON.stringify([s.id, s.kf_in, s.kf_out, s.end_mode, job.preset_final, job.segments.length,
-      kfVersions(job, s)]),
+      kfVersions(job, s), job.style]),
     (s) => renderSegment(job, s));
   for (const s of job.segments) updateSegment(job, s);
   syncOne(view.querySelector(".assembly"), JSON.stringify([job.segments.map((s) => s.retained_take_id),
@@ -608,6 +608,7 @@ function renderJobHead(job) {
       h("input", { class: "title-input", value: job.title, placeholder: `Projet ${job.id}`, onchange: patch("title"),
         title: "Titre du projet (clique pour le changer)" }),
       badge(job.status)),
+    styleField(job),
     advanced(`job-${job.id}`, "Réglages du projet",
       h("div", { class: "row settings" },
         h("label", {}, "Modèle du rendu final",
@@ -622,6 +623,31 @@ function renderJobHead(job) {
           : "Exacte : le rendu final de chaque plan arrive exactement sur son image de fin (modèle 14B).")),
   ];
 }
+
+// The job's style (P9): put in front of every motion prompt and of an image created from text alone,
+// so it is written once. A painted or drawn image needs it: without it the video turns photorealistic.
+function styleField(job) {
+  const input = h("input", { class: "style-input", value: job.style,
+    placeholder: "ex. « A watercolor painting, loose wet brushstrokes, visible paper texture » (vide pour une photo)",
+    onchange: (ev) => act(() => api("PATCH", `/jobs/${job.id}`, { style: ev.target.value })) });
+  return h("div", { class: "style-field" },
+    h("label", {}, "Style des images", input),
+    fold(`style-${job.id}`, "adv", "À quoi ça sert, exemples",
+      h("p", { class: "muted small" },
+        "Pour une aquarelle, un dessin, une peinture : sans le style nommé, la vidéo vire à la photo. En anglais. " +
+        "Il est mis devant chaque prompt de mouvement et devant une image créée depuis le texte seul (une image " +
+        "retouchée garde le style de sa source) : plus besoin de le répéter. Il vaut pour les prochains rendus, " +
+        "pas pour les prises déjà faites."),
+      h("div", { class: "tips-examples" }, h("span", { class: "muted" }, "Exemples (clic pour le prendre) :"),
+        STYLE_EXAMPLES.map((e) => h("button", { type: "button", class: "link", title: "Prendre ce style",
+          onclick: () => act(() => api("PATCH", `/jobs/${job.id}`, { style: e })) }, `« ${e} »`)))));
+}
+
+const STYLE_EXAMPLES = [
+  "A watercolor painting, loose wet brushstrokes, soft pigment bleeding, visible paper texture",
+  "A pencil drawing, graphite lines and hatching on white paper",
+  "An oil painting, thick visible brushstrokes, canvas texture",
+];
 
 // --- keyframes ----------------------------------------------------------------------------------
 
@@ -800,7 +826,9 @@ const MOTION_TIPS = [
   "En anglais : les modèles vidéo le suivent mieux qu'en français.",
   "Décris l'image, puis ce qui bouge, dans l'ordre : sujet, mouvement, caméra. Ex. « … smiles, then winks. Static camera ».",
   "Nomme le style s'il n'est pas photo (« a watercolor painting, loose wet brushstrokes, paper texture ») : sans ça, " +
-    "une aquarelle ou un dessin vire vite à la photo.",
+    "une aquarelle ou un dessin vire vite à la photo. Le plus simple : l'écrire une fois dans « Style des images », en haut.",
+  "Image peinte ou dessinée : pour que le style tienne pendant le mouvement, crée l'image de fin depuis l'image de " +
+    "départ (« Créer une image », ex. « Make her smile widely ») ; le rendu final arrive sur une image peinte.",
   "Un ou deux mouvements par plan, pas une histoire : 2 à 3 s, c'est court. Pour une suite d'actions, ajoute des images et des plans.",
   "Dis ce qui ne bouge pas (« static camera », « plain white background ») pour éviter les mouvements parasites.",
   "Avec une image de fin, décris le chemin vers elle : le rendu final y arrive de toute façon.",
@@ -929,7 +957,8 @@ function renderReview(r, field, q) {
         h("ul", { class: "checks" }, res.issues.map((t) => h("li", {}, t)))] : null,
       res.suggestion ? h("blockquote", { class: "suggestion" }, res.suggestion) : h("p", { class: "muted" }, "Pas de proposition."),
       placeholder ? h("p", { class: "muted small" }, "Remplace [style] par le style de l'image " +
-        "(« A watercolor painting of… », « A pencil drawing of… »…) : l'IA ne voit pas l'image.") : null,
+        "(« A watercolor painting of… », « A pencil drawing of… »…) : l'IA ne voit pas l'image. Ou écris-le une " +
+        "fois dans « Style des images », en haut du projet.") : null,
       res.suggestion ? h("div", { class: "row" },
         h("button", { type: "button", class: "primary", title: "Remplace le prompt par cette version",
           onclick: () => fillField(field, res.suggestion) }, "Utiliser cette version"),
@@ -1170,7 +1199,7 @@ function openKeygenCompare(g) {
 
 function updateKeygens(view, job) {
   syncOne(view.querySelector(".keygen-form"), JSON.stringify([job.id, job.keyframes.map((k) => [k.position, k.version]),
-    hasTakes(job), state.presets.length]), renderKeygenForm);
+    hasTakes(job), state.presets.length, job.style]), renderKeygenForm);
   const form = view.querySelector(".keygen-form");
   syncReview(form.querySelector(".review-box"), latestReview(job, (r) => r.target === "image"),
     form.querySelector("textarea.prompt"));
@@ -1260,6 +1289,7 @@ function renderSegment(job, s) {
         thumb(kout, s.kf_out === null ? "fin libre" : s.end_mode === "guide" ? "fin indicative" : "fin")),
       h("div", { class: "seg-form" },
         h("label", {}, "Que se passe-t-il ? (prompt)", prompt),
+        job.style ? h("p", { class: "muted small" }, `Mis devant, style du projet : « ${job.style} »`) : null,
         checks.box,
         h("div", { class: "row" }, reviewButton(job, promptBody, save)),
         h("div", { class: "review-box" }),
@@ -1276,6 +1306,8 @@ function renderSegment(job, s) {
           "L'aperçu (modèle rapide) sert à vérifier le prompt et le mouvement ; il part toujours de l'image de " +
           "départ seule" + (flf ? ", donc il ne montre pas la fin que le rendu final atteindra." : ".") +
           " Le rendu final est la version de qualité : lance-le quand l'aperçu te convient.",
+          " L'aperçu ne garde pas un style peint ou dessiné : dès sa 4ᵉ image il redessine le visage dans un " +
+          "rendu lisse. Il sert à juger le mouvement et le rythme ; le rendu final (14B) garde le style de l'image.",
           s.kf_out !== null && s.end_mode === "guide"
             ? " Compare la dernière image de l'aperçu avec l'image de fin indicative." : ""),
         advanced(`seg-${s.id}`,

@@ -97,6 +97,15 @@ def new_seed() -> int:
     return random.randint(0, 2**31 - 1)
 
 
+def with_style(prompt: str, style: str) -> str:
+    """The prompt led by the job's style ("a watercolor painting, ... . She smiles."), unless the
+    prompt already contains it."""
+    prompt, style = prompt.strip(), style.strip().rstrip(".").strip()
+    if not style or style.lower() in prompt.lower():
+        return prompt
+    return f"{style}. {prompt}" if prompt else f"{style}."
+
+
 def build_settings(
     preset: Preset,
     *,
@@ -105,11 +114,13 @@ def build_settings(
     image_end: Path | None,
     duration_s: float,
     seed: int,
+    style: str = "",
 ) -> dict[str, Any]:
-    """The complete settings dict sent to Wan2GP for one take, seed included."""
+    """The complete settings dict sent to Wan2GP for one take, seed included. `style` is the
+    job's, put in front of the prompt."""
     if image_end is not None and not preset.end_frame:
         raise PresetError(f"Preset {preset.name} takes no end frame")
-    full_prompt = prompt.strip()
+    full_prompt = with_style(prompt, style)
     if preset.style:
         full_prompt = f"{full_prompt}, {preset.style}" if full_prompt else preset.style
     settings: dict[str, Any] = dict(preset.settings)
@@ -149,6 +160,7 @@ def build_keygen_settings(
     images: list[Path],
     image_size: tuple[int, int],
     seed: int,
+    style: str = "",
 ) -> dict[str, Any]:
     """Settings sent to Wan2GP to create an image with Flux 2 Klein.
 
@@ -156,12 +168,15 @@ def build_keygen_settings(
     `KI` reference mode), the next ones people or objects to bring in. With none, the image comes
     from the text alone. `image_size` gives the aspect ratio (the main source's, or the format
     chosen for a text-only image). The preset's `prompt_suffix`, which asks to keep the main
-    source unchanged, only follows an edit; with sources, the instruction may be empty."""
+    source unchanged, only follows an edit; with sources, the instruction may be empty. The job's
+    `style` only leads an image from text alone: an edit keeps its source's style."""
     if preset.tier != "keyframe":
         raise PresetError(f"Preset {preset.name} is not a keyframe preset")
     prompt = instruction.strip()
     if not images and not prompt:
         raise PresetError("A text-only image needs a prompt")
+    if not images:
+        prompt = with_style(prompt, style)
     if images and preset.prompt_suffix:
         sep = " " if prompt.endswith((".", "!", "?")) else ". "
         prompt = f"{prompt}{sep}{preset.prompt_suffix}" if prompt else preset.prompt_suffix

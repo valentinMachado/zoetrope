@@ -50,22 +50,26 @@ def _get(conn: sqlite3.Connection, table: str, row_id: int) -> dict[str, Any]:
 
 
 def create_job(conn: sqlite3.Connection, title: str = "", preset_final: str = presets.DEFAULT_FINAL,
-               end_mode: str = "exact") -> dict[str, Any]:
+               end_mode: str = "exact", style: str = "") -> dict[str, Any]:
     _check_final_preset(preset_final)
     _check_end_mode(end_mode)
     cur = conn.execute(
-        "INSERT INTO job (title, created_at, preset_final, end_mode) VALUES (?, ?, ?, ?)",
-        (title, db.now(), preset_final, end_mode),
+        "INSERT INTO job (title, created_at, preset_final, end_mode, style) VALUES (?, ?, ?, ?, ?)",
+        (title, db.now(), preset_final, end_mode, style.strip()),
     )
     return _get(conn, "job", cur.lastrowid)
 
 
 def update_job(conn: sqlite3.Connection, job_id: int, *, title: str | None = None,
-               preset_final: str | None = None, end_mode: str | None = None) -> dict[str, Any]:
+               preset_final: str | None = None, end_mode: str | None = None,
+               style: str | None = None) -> dict[str, Any]:
+    """A new style applies to the takes and images created from then on, not to past ones."""
     _get(conn, "job", job_id)
     fields: dict[str, Any] = {}
     if title is not None:
         fields["title"] = title
+    if style is not None:
+        fields["style"] = style.strip()
     if preset_final is not None:
         _check_final_preset(preset_final)
         fields["preset_final"] = preset_final
@@ -328,6 +332,10 @@ def create_keygen(conn: sqlite3.Connection, job_id: int, position: int, instruct
     return _queue_keygen(conn, job_id, position, instruction, resolved, size, seed, preset)
 
 
+def _job_style(conn: sqlite3.Connection, job_id: int) -> str:
+    return _get(conn, "job", job_id)["style"] or ""
+
+
 def _queue_keygen(conn: sqlite3.Connection, job_id: int, position: int, instruction: str,
                   sources: list[tuple[dict[str, Any], Image.Image]], size: tuple[int, int],
                   seed: int | None, preset: str) -> dict[str, Any]:
@@ -355,7 +363,7 @@ def _queue_keygen(conn: sqlite3.Connection, job_id: int, position: int, instruct
             meta.append({**m, "file": str(f)})
         try:
             settings = presets.build_keygen_settings(p, instruction=instruction, images=files, image_size=size,
-                                                     seed=seed)
+                                                     seed=seed, style=_job_style(conn, job_id))
         except presets.PresetError as e:
             raise Invalid(str(e)) from None
         (d / f"{gen_id}.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
@@ -427,8 +435,9 @@ def review_context(conn: sqlite3.Connection, job_id: int, target: str, *, segmen
     """What the review knows besides the text. Motion: the segment's duration (or `duration_s`,
     not saved yet) and end image. Image: the target position and the kinds of its `sources`
     (keyframe positions, or "upload"). Both: the prompts the images involved were created with,
-    which often name their style and subject (the AI does not see the images)."""
-    _get(conn, "job", job_id)
+    which often name their style and subject (the AI does not see the images). The job's style,
+    which the render puts in front of a motion prompt or of an image from text alone."""
+    style = _job_style(conn, job_id) or None
     if target == "motion":
         if segment_id is None:
             raise Invalid("A motion prompt review needs its segment")
@@ -445,7 +454,7 @@ def review_context(conn: sqlite3.Connection, job_id: int, target: str, *, segmen
         if made:
             notes.append(f"The end image was created from this prompt: \"{made}\"")
         return prompt_review.Context("motion", duration_s=duration_s or seg["duration_s"], end_image=end,
-                                     notes=tuple(notes))
+                                     notes=tuple(notes), style=style)
     if target != "image":
         raise Invalid(f"target must be one of {', '.join(prompt_review.TARGETS)}")
     kinds, notes = [], []
@@ -462,7 +471,7 @@ def review_context(conn: sqlite3.Connection, job_id: int, target: str, *, segmen
         if made:
             notes.append(f"The start image of the video was created from this prompt: \"{made}\"")
     return prompt_review.Context("image", position=position if position is not None else 0,
-                                 sources=tuple(kinds), notes=tuple(notes))
+                                 sources=tuple(kinds), notes=tuple(notes), style=None if kinds else style)
 
 
 def check_prompt(conn: sqlite3.Connection, job_id: int, target: str, text: str, **where: Any) -> list[dict[str, Any]]:
@@ -595,7 +604,7 @@ def create_take(conn: sqlite3.Connection, segment_id: int, tier: str, *, seed: i
             shutil.copyfile(end, end_copy)
         try:
             settings = presets.build_settings(p, prompt=seg["prompt"], image_start=start_copy, image_end=end_copy,
-                                              duration_s=seg["duration_s"], seed=seed)
+                                              duration_s=seg["duration_s"], seed=seed, style=job["style"])
         except presets.PresetError as e:
             raise Invalid(str(e)) from None
         (d / f"{take_id}.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")

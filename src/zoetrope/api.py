@@ -50,12 +50,14 @@ class JobIn(BaseModel):
     title: str = ""
     preset_final: str = presets.DEFAULT_FINAL
     end_mode: str = "exact"
+    style: str = ""
 
 
 class JobPatch(BaseModel):
     title: str | None = None
     preset_final: str | None = None
     end_mode: str | None = None
+    style: str | None = None
 
 
 class MatchIn(BaseModel):
@@ -118,7 +120,7 @@ def list_jobs(conn=Conn):
 
 @app.post("/api/jobs", status_code=201)
 def create_job(body: JobIn, conn=Conn):
-    job = service.create_job(conn, body.title, body.preset_final, body.end_mode)
+    job = service.create_job(conn, body.title, body.preset_final, body.end_mode, body.style)
     return service.job_detail(conn, job["id"])
 
 

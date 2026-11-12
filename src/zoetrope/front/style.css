@@ -190,6 +190,10 @@ h2.first { margin-top: 0; }
 .job-head { display: flex; flex-direction: column; gap: 10px; }
 .title-input { font-size: 20px; font-weight: 600; flex: 1; min-width: 200px; border-color: transparent; background: none; }
 .title-input:hover, .title-input:focus { border-color: var(--line); background: var(--card); }
+.style-field { margin: 8px 0 4px; }
+.style-field label { display: flex; flex-direction: column; gap: 4px; font-weight: 600; }
+.style-input { width: 100%; font-weight: normal; }
+.style-field p { margin: 4px 0; }
 .settings label { min-width: 260px; }
 
 .keyframes { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 6px; align-items: stretch; }

@@ -77,16 +77,18 @@ class Context:
     position: int | None = None  # image: 0 = the start image
     sources: tuple[str, ...] = ()  # image: "start", "keyframe" or "upload", the first is the main scene
     notes: tuple[str, ...] = field(default_factory=tuple)
+    style: str | None = None  # the job's style, put in front of the prompt at render time
 
     def to_json(self) -> dict[str, Any]:
         return {"target": self.target, "duration_s": self.duration_s, "end_image": self.end_image,
-                "position": self.position, "sources": list(self.sources), "notes": list(self.notes)}
+                "position": self.position, "sources": list(self.sources), "notes": list(self.notes),
+                "style": self.style}
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Context:
         return cls(target=d["target"], duration_s=d.get("duration_s"), end_image=d.get("end_image"),
                    position=d.get("position"), sources=tuple(d.get("sources") or ()),
-                   notes=tuple(d.get("notes") or ()))
+                   notes=tuple(d.get("notes") or ()), style=d.get("style"))
 
 
 def _plain(text: str) -> str:
@@ -137,8 +139,9 @@ def check(text: str, ctx: Context) -> list[dict[str, Any]]:
         findings.append({"code": "french"})
     if len(words) < SHORT_WORDS and not edit:
         findings.append({"code": "short", "words": len(words)})
-    # An edit keeps the style of its source image; a motion prompt or an image from text alone must name it.
-    if not edit and not _has_any(plain, STYLE_WORDS):
+    # An edit keeps the style of its source image; a motion prompt or an image from text alone must
+    # name it, unless the job's style is put in front of it.
+    if not edit and not ctx.style and not _has_any(plain, STYLE_WORDS):
         findings.append({"code": "no_style"})
     if ctx.target == "motion":
         if not _has_any(plain, CAMERA_WORDS):
@@ -255,6 +258,9 @@ def describe_context(ctx: Context) -> list[str]:
             lines.append("Source images: " + "; ".join(
                 f"{i + 1}. {names.get(s, s)}" + (" (main scene, edited)" if i == 0 else "")
                 for i, s in enumerate(ctx.sources)) + ".")
+    if ctx.style:
+        lines.append(f"The visual style is put in front of the prompt automatically: \"{ctx.style}\". "
+                     "Do not repeat it.")
     lines += list(ctx.notes)
     return lines
 

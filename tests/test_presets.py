@@ -78,3 +78,19 @@ def test_keygen_settings_from_text_alone_or_several_images():
     assert s["image_refs"] == ["a.png", "b.png"] and s["prompt"] == p.prompt_suffix
     with pytest.raises(presets.PresetError):
         presets.build_keygen_settings(p, instruction=" ", images=[], image_size=(1, 1), seed=1)
+
+
+def test_job_style_leads_the_prompt_unless_already_there():
+    assert presets.with_style("She smiles.", "A watercolor painting, wet brushstrokes.") == \
+        "A watercolor painting, wet brushstrokes. She smiles."
+    assert presets.with_style("A watercolor painting, wet brushstrokes. She smiles.",
+                              "a watercolor painting, wet brushstrokes") == \
+        "A watercolor painting, wet brushstrokes. She smiles."
+    assert presets.with_style("She smiles.", "  ") == "She smiles."
+    p = presets.load(presets.KEYFRAME)
+    text = presets.build_keygen_settings(p, instruction="A fox.", images=[], image_size=(1, 1), seed=1,
+                                         style="A pencil drawing")
+    assert text["prompt"] == "A pencil drawing. A fox."
+    edit = presets.build_keygen_settings(p, instruction="Make her wink.", images=[Path("a.png")],
+                                         image_size=(1, 1), seed=1, style="A pencil drawing")
+    assert "pencil" not in edit["prompt"]  # an edit keeps the style of its source

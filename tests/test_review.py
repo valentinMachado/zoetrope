@@ -202,3 +202,16 @@ def test_api_check_review_and_cancel(outputs):
     rid = r.json()["id"]
     assert client.get("/api/queue").json()["items"][0]["kind"] == "review"
     assert client.post(f"/api/reviews/{rid}/cancel").json()["status"] == "cancelled"
+
+
+def test_job_style_silences_no_style_and_is_told_to_the_ai(conn):
+    job, seg = _job(conn)
+    service.update_job(conn, job["id"], style="A watercolor painting, loose wet brushstrokes")
+    ctx = service.review_context(conn, job["id"], "motion", segment_id=seg["id"])
+    assert ctx.style == "A watercolor painting, loose wet brushstrokes"
+    assert "no_style" not in codes("She smiles, static camera, plain white background", ctx)
+    assert any("put in front of the prompt" in line for line in prompt_review.describe_context(ctx))
+    assert Context.from_json(ctx.to_json()) == ctx
+    text_only = service.review_context(conn, job["id"], "image", position=2)
+    edit = service.review_context(conn, job["id"], "image", position=2, sources=[0])
+    assert text_only.style and edit.style is None

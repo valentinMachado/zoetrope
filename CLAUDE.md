@@ -52,7 +52,9 @@ follows the user's path in five steps and says what to do next from the job's st
 (`nextStep()` in `app.js`); fine settings sit in folded « Avancé » blocks. Every prompt field
 lists instant rule findings as the user types, and offers an AI review (Qwen3 4B, Klein's text
 encoder, a `review` task at the head of the queue) that proposes a corrected prompt
-(`prompt_review.py`).
+(`prompt_review.py`). A job's style (`job.style`) is put in front of its motion prompts and of
+images created from text alone; FastWan previews do not keep a painted style, the 14B does
+(docs/benchmark.md, "Holding a painted style").
 
 Queue order, take/keygen/review/assembly lifecycle and keyframe preparation are documented in the
 module docstrings (`queue.py`, `service.py`, `worker.py`, `prompt_review.py`, `images.py`,

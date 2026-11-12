@@ -190,3 +190,15 @@ def test_old_base_gets_the_new_keyframe_column(outputs):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(keyframe)").fetchall()}
     conn.close()
     assert "source_keygen_id" in cols
+
+
+def test_job_style_leads_new_take_prompts(client):
+    job = _job_with_keyframes(client, n=1)
+    seg = job["segments"][0]
+    client.patch(f"/api/segments/{seg['id']}", json={"prompt": "the man smiles"})
+    before = client.post(f"/api/segments/{seg['id']}/takes", json={"tier": "preview"}).json()
+    patched = client.patch(f"/api/jobs/{job['id']}", json={"style": "A watercolor painting"}).json()
+    assert patched["style"] == "A watercolor painting"
+    styled = client.post(f"/api/segments/{seg['id']}/takes", json={"tier": "preview"}).json()
+    assert styled["settings"]["prompt"] == "A watercolor painting. the man smiles"
+    assert client.get(f"/api/takes/{before['id']}").json()["settings"]["prompt"] == "the man smiles"
