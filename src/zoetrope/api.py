@@ -75,6 +75,12 @@ class TakeIn(BaseModel):
     preset: str | None = None
 
 
+class KeygenIn(BaseModel):
+    position: int
+    instruction: str
+    seed: int | None = None
+
+
 class RetainIn(BaseModel):
     take_id: int | None
 
@@ -129,6 +135,21 @@ def match_keyframe(keyframe_id: int, body: MatchIn, conn=Conn):
 @app.delete("/api/keyframes/{keyframe_id}", status_code=204)
 def delete_keyframe(keyframe_id: int, conn=Conn):
     service.delete_keyframe(conn, keyframe_id)
+
+
+@app.post("/api/jobs/{job_id}/keygens", status_code=201)
+def create_keygen(job_id: int, body: KeygenIn, conn=Conn):
+    return service.create_keygen(conn, job_id, body.position, body.instruction, seed=body.seed)
+
+
+@app.post("/api/keygens/{gen_id}/use")
+def use_keygen(gen_id: int, conn=Conn):
+    return service.use_keygen(conn, gen_id)
+
+
+@app.post("/api/keygens/{gen_id}/cancel")
+def cancel_keygen(gen_id: int, conn=Conn):
+    return service.cancel(conn, "keygen", gen_id)
 
 
 @app.patch("/api/segments/{segment_id}")

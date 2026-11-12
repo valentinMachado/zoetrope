@@ -317,6 +317,13 @@ Mean difference to the start image (grey levels), frames 0 / 10 / 20 / 30 / 40:
   blobs** on the background around frames 10-20, likely from the coloured fringes of the cut-out,
   which the Klein keyframe keeps at both ends.
 
+Re-run through Zoetrope in P10 (job 5: keygen #1, then final take #7, same seed and prompt): the
+created keyframe is near-identical to the one above (pixel deviation after the match 5.3), and the
+FLF gives 1.7 / 26.9 / 25.2 / 24.1 / 10.8 at frames 0 / 10 / 20 / 30 / 40, the same as above,
+with the same overshooting grin and yellow blobs. The keygen took 3 min 13 s from a cold worker
+(Wan2GP session start ~1 min, Klein load 62 s, text encoding 41 s, 4 steps 27 s); the 14B then
+reloaded in 20 s, take 21 min 27 s.
+
 ### Verdict
 
 **Flux 2 Klein 4B is fit for the identity match**, as "edit the start image with a text
@@ -342,7 +349,8 @@ The backend uses it for every final render, queued (preset `final-14b`).
 
 **Flux 2 Klein 4B for keyframes**: an end keyframe made by editing the start image with a text
 instruction (~40 s at 512) keeps the start's identity through the 14B FLF, where a FastWan frame
-pulls it away (section above). Not wired into the backend yet.
+pulls it away (section above). Wired into the backend and front as "create an image from the
+start" (preset `keyframe-klein`).
 
 **ComfyUI: not yet.** Wan2GP already provides everything the brief expects from ComfyUI:
 headless runs (`wgp.py --process settings.json`), a Python API (`WanGPSession`) and an MCP

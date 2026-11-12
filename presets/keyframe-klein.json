@@ -1,0 +1,22 @@
+{
+  "label": "Keyframe: Flux 2 Klein 4B, edit the start image, 4 steps",
+  "tier": "keyframe",
+  "end_frame": false,
+  "fps": 0,
+  "memory_profile": 4,
+  "style": "",
+  "loras": [],
+  "prompt_suffix": "Keep the same person, face, hair, image style, framing, lighting and background unchanged.",
+  "settings": {
+    "model_type": "flux2_klein_4b",
+    "image_mode": 1,
+    "video_prompt_type": "KI",
+    "resolution": "480x512",
+    "num_inference_steps": 4,
+    "embedded_guidance_scale": 1,
+    "batch_size": 1,
+    "remove_background_images_ref": 0
+  },
+  "estimates": {"loading_model": 15, "encoding_text": 8, "inference_step": 6, "decoding": 5},
+  "notes": "P8 setting C (docs/benchmark.md): the start image alone as reference, a text instruction, ~40 s at 480x512. The resolution is a pixel budget, the output keeps the start image's aspect ratio."
+}

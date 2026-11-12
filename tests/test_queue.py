@@ -3,14 +3,24 @@ import json
 from zoetrope import db, queue
 
 
-def _take(conn, tier, model, profile=4, status="queued"):
+def _keygen(conn, created_at):
+    conn.execute("INSERT INTO job (id, created_at, preset_final) VALUES (1, 0, 'final-14b') ON CONFLICT DO NOTHING")
+    cur = conn.execute(
+        "INSERT INTO keygen (job_id, position, instruction, preset, model_type, memory_profile, settings, seed, "
+        "created_at) VALUES (1, 1, 'smile', 'keyframe-klein', 'flux2_klein_4b', 4, ?, 1, ?)",
+        (json.dumps({"num_inference_steps": 4}), created_at),
+    )
+    return cur.lastrowid
+
+
+def _take(conn, tier, model, profile=4, status="queued", created_at=0):
     conn.execute("INSERT INTO job (id, created_at, preset_final) VALUES (1, 0, 'final-14b') ON CONFLICT DO NOTHING")
     conn.execute("INSERT INTO segment (id, job_id, idx, kf_in) VALUES (1, 1, 0, 0) ON CONFLICT DO NOTHING")
     preset = "preview" if tier == "preview" else "final-14b"
     cur = conn.execute(
         "INSERT INTO take (segment_id, tier, preset, model_type, memory_profile, settings, seed, fps, status, "
-        "created_at) VALUES (1, ?, ?, ?, ?, ?, 1, 16, ?, 0)",
-        (tier, preset, model, profile, json.dumps({"num_inference_steps": 4}), status),
+        "created_at) VALUES (1, ?, ?, ?, ?, ?, 1, 16, ?, ?)",
+        (tier, preset, model, profile, json.dumps({"num_inference_steps": 4}), status, created_at),
     )
     return cur.lastrowid
 
@@ -59,3 +69,15 @@ def test_running_take_before_first_event_counts_the_whole_take(conn):
     left = queue.snapshot(conn, now=1000.0)["items"][0]["remaining_s"]
     assert left == queue.take_total_estimate(est, db.row(conn.execute("SELECT * FROM take").fetchone()), True)
     assert left > 1000
+
+
+def test_keygens_go_with_previews_in_creation_order(conn):
+    f1 = _take(conn, "final", "A", created_at=1)
+    p1 = _take(conn, "preview", "P", 1, created_at=2)
+    k1 = _keygen(conn, created_at=3)
+    p2 = _take(conn, "preview", "P", 1, created_at=4)
+    order = [(t.kind, t.id) for t in queue.pending(conn, loaded=("A", 4.0))]
+    assert order == [("take", p1), ("keygen", k1), ("take", p2), ("take", f1)]
+    snap = queue.snapshot(conn, now=1000.0)
+    item = next(i for i in snap["items"] if i["kind"] == "keygen")
+    assert 0 < item["remaining_s"] < 120  # Klein's estimate, not a video model's

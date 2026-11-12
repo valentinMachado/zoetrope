@@ -3,8 +3,10 @@ loaded model survives between takes (the 14B takes minutes to load).
 
 It talks to the API only through the SQLite base: picks the next task (zoetrope.queue order),
 writes progress at each Wan2GP event (phase, step, last preview image, log tail, phase
-durations), honours cancel_requested, and keeps a heartbeat. Assemblies run in the same queue
-(CPU, plus RIFE on the GPU for fps x2).
+durations), honours cancel_requested, and keeps a heartbeat. Keyframe generations (keygens,
+Flux 2 Klein) run like takes, in the same session: loading Klein unloads the video model. A
+finished keygen's image becomes the keyframe at its position (service.use_keygen). Assemblies run
+in the same queue (CPU, plus RIFE on the GPU for fps x2).
 
 Start it detached with scripts/start-worker.ps1, stop it with scripts/stop-worker.ps1 (a stop file,
 read between tasks; -Force kills it). After a crash, a take left running goes back to the queue;
@@ -28,8 +30,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
+
 from . import assembly as assembly_mod
-from . import db, paths
+from . import db, paths, service
 from . import queue as task_queue
 
 log = logging.getLogger("zoetrope.worker")
@@ -74,7 +78,7 @@ class Worker:
     def recover(self) -> None:
         """Tasks left running by a dead worker go back to the queue, or fail on a second crash."""
         with db.transaction(self.conn):
-            for table in ("take", "assembly"):
+            for table in ("take", "keygen", "assembly"):
                 for r in self.conn.execute(f"SELECT id, interruptions, cancel_requested FROM {table} "
                                            "WHERE status = 'running'").fetchall():
                     n = r["interruptions"] + 1
@@ -148,6 +152,8 @@ class Worker:
         try:
             if task.kind == "take":
                 self.run_take(task.row)
+            elif task.kind == "keygen":
+                self.run_keygen(task.row)
             else:
                 self.run_assembly(task.row)
         finally:
@@ -163,14 +169,45 @@ class Worker:
     # --- takes ------------------------------------------------------------------------------
 
     def run_take(self, take: dict[str, Any]) -> None:
-        take_id = take["id"]
         job_id = self.conn.execute("SELECT job_id FROM segment WHERE id = ?", (take["segment_id"],)).fetchone()[0]
-        folder = paths.takes_dir(job_id)
+
+        def store(src: Path, dest_stem: Path) -> Path:
+            dest = dest_stem.with_suffix(src.suffix or ".mp4")
+            shutil.move(str(src), dest)
+            return dest
+
+        self._run_model_task("take", take, paths.takes_dir(job_id), store)
+
+    def run_keygen(self, gen: dict[str, Any]) -> None:
+        """Generate a keyframe; when done, it replaces the keyframe at its position. If that
+        fails (the position no longer exists), the keygen stays done with the reason in `error`
+        and the user can use it later."""
+
+        def store(src: Path, dest_stem: Path) -> Path:
+            dest = dest_stem.with_suffix(".png")
+            with Image.open(src) as im:
+                im.convert("RGB").save(dest, "PNG")
+            src.unlink(missing_ok=True)
+            return dest
+
+        if self._run_model_task("keygen", gen, paths.keygens_dir(gen["job_id"]), store) != "done":
+            return
+        try:
+            service.use_keygen(self.conn, gen["id"])
+        except (service.Invalid, service.NotFound) as e:
+            log.warning("keygen %d not installed: %s", gen["id"], e)
+            db.update(self.conn, "keygen", gen["id"], error=f"Not installed as keyframe: {e}")
+
+    def _run_model_task(self, table: str, row: dict[str, Any], folder: Path,
+                        store: Callable[[Path, Path], Path]) -> str:
+        """Submit a take or keygen to Wan2GP, track it, and `store` its file as folder/<id>.<ext>.
+        Returns the final status."""
+        row_id = row["id"]
         folder.mkdir(parents=True, exist_ok=True)
-        settings = json.loads(take["settings"])
+        settings = json.loads(row["settings"])
         steps = int(settings.get("num_inference_steps", 0)) or None
-        group = (take["model_type"], float(take["memory_profile"]))
-        tracker = _Progress(self.conn, take_id, folder, steps)
+        group = (row["model_type"], float(row["memory_profile"]))
+        tracker = _Progress(self.conn, table, row_id, folder, steps)
         errors: list[str] = []
         cancel_sent = False
         try:
@@ -184,26 +221,25 @@ class Worker:
                         self.loaded = group  # past loading: this model and profile are in memory now
                 if not cancel_sent and tracker.due_check():
                     tracker.flush()
-                    if self._cancel_requested("take", take_id):
-                        log.info("cancelling take %d", take_id)
+                    if self._cancel_requested(table, row_id):
+                        log.info("cancelling %s %d", table, row_id)
                         job.cancel()
                         cancel_sent = True
             result = job.result()
-        except Exception as e:  # noqa: BLE001 - any failure ends the take, never the worker
-            log.exception("take %d crashed", take_id)
-            tracker.finish("failed", error=f"{type(e).__name__}: {e}")
-            return
-        if cancel_sent or self._cancel_requested("take", take_id):
-            tracker.finish("cancelled")
-        elif result.success and result.generated_files:
-            src = Path(result.generated_files[0])
-            dest = folder / f"{take_id}{src.suffix or '.mp4'}"
-            shutil.move(str(src), dest)
+        except Exception as e:  # noqa: BLE001 - any failure ends the task, never the worker
+            log.exception("%s %d crashed", table, row_id)
+            return tracker.finish("failed", error=f"{type(e).__name__}: {e}")
+        if cancel_sent or self._cancel_requested(table, row_id):
+            return tracker.finish("cancelled")
+        if result.success and result.generated_files:
+            try:
+                dest = store(Path(result.generated_files[0]), folder / str(row_id))
+            except OSError as e:
+                return tracker.finish("failed", error=f"Could not store the output: {e}")
             self.loaded = group
-            tracker.finish("done", output_file=str(dest))
-        else:
-            errors += [e.message for e in result.errors]
-            tracker.finish("failed", error="; ".join(errors) or "Wan2GP returned no file")
+            return tracker.finish("done", output_file=str(dest))
+        errors += [e.message for e in result.errors]
+        return tracker.finish("failed", error="; ".join(errors) or "Wan2GP returned no file")
 
     def _cancel_requested(self, table: str, row_id: int) -> bool:
         r = self.conn.execute(f"SELECT cancel_requested FROM {table} WHERE id = ?", (row_id,)).fetchone()
@@ -265,10 +301,12 @@ def _events(job: Any):
 
 
 class _Progress:
-    """Turns Wan2GP events into take rows: throttled writes, phase durations, preview image, log."""
+    """Turns Wan2GP events into take (or keygen) rows: throttled writes, phase durations, preview
+    image, log."""
 
-    def __init__(self, conn: sqlite3.Connection, take_id: int, folder: Path, steps: int | None):
+    def __init__(self, conn: sqlite3.Connection, table: str, take_id: int, folder: Path, steps: int | None):
         self.conn = conn
+        self.table = table
         self.take_id = take_id
         self.folder = folder
         self.steps = steps
@@ -317,7 +355,7 @@ class _Progress:
                 tmp.replace(self.preview_file)
                 self.fields["preview_file"] = str(self.preview_file)
             except OSError:
-                log.warning("could not write preview of take %d", self.take_id)
+                log.warning("could not write preview of %s %d", self.table, self.take_id)
         elif ev.kind == "stream":
             text = ev.data.text.rstrip()
             if text:
@@ -354,12 +392,12 @@ class _Progress:
         if not self.fields:
             return
         self.fields["durations"] = json.dumps(self.durations())
-        db.update(self.conn, "take", self.take_id, **self.fields)
+        db.update(self.conn, self.table, self.take_id, **self.fields)
         self.fields = {}
         self.last_flush = time.time()
         self.log_file.flush()
 
-    def finish(self, status: str, *, output_file: str | None = None, error: str | None = None) -> None:
+    def finish(self, status: str, *, output_file: str | None = None, error: str | None = None) -> str:
         self.fields.update(status=status, finished_at=db.now())
         if output_file:
             self.fields["output_file"] = output_file
@@ -368,7 +406,8 @@ class _Progress:
             self.log_file.write(f"[zoetrope] {status}: {error}\n")
         self.flush()
         self.log_file.close()
-        log.info("take %d %s", self.take_id, status)
+        log.info("%s %d %s", self.table, self.take_id, status)
+        return status
 
 
 def _single_instance_lock() -> Any:

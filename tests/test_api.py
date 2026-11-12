@@ -132,3 +132,35 @@ def test_front_is_served(client):
     assert r.status_code == 200 and "app.js" in r.text
     assert client.get("/app.js").status_code == 200
     assert client.get("/api/presets").json()[0]["estimates"]
+
+
+def test_keygen_routes(client):
+    job = _job_with_keyframes(client, n=2)
+    url = f"/api/jobs/{job['id']}/keygens"
+    assert client.post(url, json={"position": 0, "instruction": "smile"}).status_code == 400
+    assert client.post(url, json={"position": 3, "instruction": "smile"}).status_code == 400
+    assert client.post(url, json={"position": 1, "instruction": "  "}).status_code == 400
+    g = client.post(url, json={"position": 1, "instruction": "Make him smile", "seed": 5}).json()
+    assert g["status"] == "queued" and g["seed"] == 5
+    assert g["settings"]["image_refs"][0].replace("\\", "/").endswith(f"gen/{g['id']}_start.png")
+    q = client.get("/api/queue").json()["items"]
+    assert q[0]["kind"] == "keygen" and q[0]["position"] == 1
+    assert client.get(f"/api/jobs/{job['id']}").json()["status"] == "queued"
+    assert client.post(f"/api/keygens/{g['id']}/use").status_code == 400  # not finished
+    assert client.post(f"/api/keygens/{g['id']}/cancel").json()["status"] == "cancelled"
+
+
+def test_old_base_gets_the_new_keyframe_column(outputs):
+    import sqlite3
+
+    from zoetrope import db
+
+    old = sqlite3.connect(paths.db_path())
+    old.execute("CREATE TABLE keyframe (id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, position INTEGER NOT NULL, "
+                "orig_file TEXT NOT NULL, file TEXT NOT NULL, match_applied INTEGER NOT NULL DEFAULT 0, "
+                "match_params TEXT, deviation TEXT, created_at REAL NOT NULL, UNIQUE (job_id, position))")
+    old.close()
+    conn = db.connect()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(keyframe)").fetchall()}
+    conn.close()
+    assert "source_keygen_id" in cols

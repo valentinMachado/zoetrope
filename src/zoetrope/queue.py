@@ -1,7 +1,8 @@
 """Queue order and time estimates, shared by the worker (what to run next) and the API (what the
 front shows).
 
-Order: previews first, FIFO among them; then assemblies (short, the user is waiting for them);
+Order: previews and keyframe generations (keygens, ~40 s, the user waits for them) first, FIFO
+among them; then assemblies (short, the user is waiting for them);
 then final renders grouped by loaded model (model type + memory profile, since changing either
 reloads the model), the group already loaded first, then the others by their oldest take, FIFO
 inside a group.
@@ -19,6 +20,7 @@ from typing import Any
 
 from . import db, presets
 
+MODEL_TASKS = ("take", "keygen")  # tasks that run a Wan2GP model; their tables share the progress columns
 PHASES = ("loading_model", "encoding_text", "inference", "decoding")
 ASSEMBLY_ESTIMATE_S = 30.0
 RIFE_X2_ESTIMATE_S = 30.0  # P5: 21 s for 41 frames, model load included
@@ -26,13 +28,13 @@ RIFE_X2_ESTIMATE_S = 30.0  # P5: 21 s for 41 frames, model load included
 
 @dataclass(frozen=True)
 class Task:
-    kind: str  # "take" or "assembly"
+    kind: str  # "take", "keygen" or "assembly"
     id: int
     row: dict[str, Any]
 
     @property
     def group(self) -> tuple[str, float] | None:
-        if self.kind != "take":
+        if self.kind not in MODEL_TASKS:
             return None
         return (self.row["model_type"], float(self.row["memory_profile"]))
 
@@ -41,6 +43,9 @@ def pending(conn: sqlite3.Connection, loaded: tuple[str, float] | None) -> list[
     """Queued tasks in the order the worker will run them."""
     takes = db.rows(conn.execute("SELECT * FROM take WHERE status = 'queued' ORDER BY id").fetchall())
     previews = [Task("take", t["id"], t) for t in takes if t["tier"] == "preview"]
+    keygens = db.rows(conn.execute("SELECT * FROM keygen WHERE status = 'queued' ORDER BY id").fetchall())
+    previews += [Task("keygen", k["id"], k) for k in keygens]
+    previews.sort(key=lambda t: (t.row["created_at"], t.kind, t.id))
     finals = [Task("take", t["id"], t) for t in takes if t["tier"] == "final"]
     assemblies = [
         Task("assembly", a["id"], a)
@@ -61,14 +66,15 @@ def next_task(conn: sqlite3.Connection, loaded: tuple[str, float] | None) -> Tas
 # --- estimates --------------------------------------------------------------------------------
 
 
-def phase_estimates(conn: sqlite3.Connection, preset_name: str) -> dict[str, float]:
-    """Seconds per phase for a preset: loading_model, encoding_text, inference_step, decoding."""
+def phase_estimates(conn: sqlite3.Connection, preset_name: str, table: str = "take") -> dict[str, float]:
+    """Seconds per phase for a preset: loading_model, encoding_text, inference_step, decoding.
+    `table` is where its finished tasks live: take, or keygen for a keyframe preset."""
     try:
         est = dict(presets.load(preset_name).estimates)
     except presets.PresetError:
         est = {}
     done = conn.execute(
-        "SELECT durations FROM take WHERE preset = ? AND status = 'done' AND durations IS NOT NULL "
+        f"SELECT durations FROM {table} WHERE preset = ? AND status = 'done' AND durations IS NOT NULL "
         "ORDER BY id DESC LIMIT 5",
         (preset_name,),
     ).fetchall()
@@ -122,31 +128,32 @@ def snapshot(conn: sqlite3.Connection, now: float) -> dict[str, Any]:
     """Running task plus pending tasks, each with an estimated start and remaining time."""
     w = db.row(conn.execute("SELECT * FROM worker WHERE id = 1").fetchone()) or {}
     loaded = (w["loaded_model"], float(w["loaded_profile"])) if w.get("loaded_model") else None
-    cache: dict[str, dict[str, float]] = {}
+    cache: dict[tuple[str, str], dict[str, float]] = {}
 
-    def est_for(name: str) -> dict[str, float]:
-        if name not in cache:
-            cache[name] = phase_estimates(conn, name)
-        return cache[name]
+    def est_for(kind: str, name: str) -> dict[str, float]:
+        if (kind, name) not in cache:
+            cache[(kind, name)] = phase_estimates(conn, name, kind)
+        return cache[(kind, name)]
 
     items = []
     clock = 0.0
-    running = db.rows(conn.execute("SELECT * FROM take WHERE status = 'running'").fetchall())
+    running = [(kind, t) for kind in MODEL_TASKS
+               for t in db.rows(conn.execute(f"SELECT * FROM {kind} WHERE status = 'running'").fetchall())]
     running_asm = db.rows(conn.execute("SELECT * FROM assembly WHERE status = 'running'").fetchall())
-    for t in running:
+    for kind, t in running:
         group = (t["model_type"], float(t["memory_profile"]))
-        left = take_remaining(est_for(t["preset"]), t, now, needs_load=group != loaded)
-        items.append({"kind": "take", "id": t["id"], "status": "running", "starts_in_s": 0, "remaining_s": left})
+        left = take_remaining(est_for(kind, t["preset"]), t, now, needs_load=group != loaded)
+        items.append({"kind": kind, "id": t["id"], "status": "running", "starts_in_s": 0, "remaining_s": left})
         clock += left
-        loaded = (t["model_type"], float(t["memory_profile"]))
+        loaded = group
     for a in running_asm:
         left = ASSEMBLY_ESTIMATE_S + (RIFE_X2_ESTIMATE_S if a["fps_mode"] == "x2" else 0)
         items.append({"kind": "assembly", "id": a["id"], "status": "running", "starts_in_s": 0, "remaining_s": left})
         clock += left
     for task in pending(conn, loaded):
-        if task.kind == "take":
+        if task.kind in MODEL_TASKS:
             needs_load = task.group != loaded
-            dur = take_total_estimate(est_for(task.row["preset"]), task.row, needs_load)
+            dur = take_total_estimate(est_for(task.kind, task.row["preset"]), task.row, needs_load)
             loaded = task.group
         else:
             dur = ASSEMBLY_ESTIMATE_S + (RIFE_X2_ESTIMATE_S if task.row["fps_mode"] == "x2" else 0)

@@ -5,7 +5,9 @@ WAL mode lets the API read while the worker writes. Timestamps are Unix seconds 
 Model: a job has keyframes (positions 0..N, position 0 is the start image) and segments
 (segment i goes from keyframe i to keyframe i+1; a job with a single keyframe has one segment
 with no end frame). Each render of a segment is a take; the user retains one take per segment
-for the assembly. A job's status is derived from its takes, never stored.
+for the assembly. A keyframe can also be generated from the start image by an image editing
+model (a keygen, Flux 2 Klein): its result replaces the keyframe at its position, which then
+records the keygen in `source_keygen_id`. A job's status is derived from its tasks, never stored.
 """
 
 from __future__ import annotations
@@ -39,7 +41,38 @@ CREATE TABLE IF NOT EXISTS keyframe (
     match_params  TEXT,
     deviation     TEXT,
     created_at    REAL NOT NULL,
+    source_keygen_id INTEGER,
     UNIQUE (job_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS keygen (
+    id               INTEGER PRIMARY KEY,
+    job_id           INTEGER NOT NULL REFERENCES job(id) ON DELETE CASCADE,
+    position         INTEGER NOT NULL,
+    instruction      TEXT NOT NULL,
+    preset           TEXT NOT NULL,
+    model_type       TEXT NOT NULL,
+    memory_profile   REAL NOT NULL,
+    settings         TEXT NOT NULL,
+    seed             INTEGER NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'queued'
+                     CHECK (status IN ('queued', 'running', 'done', 'failed', 'cancelled')),
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    interruptions    INTEGER NOT NULL DEFAULT 0,
+    created_at       REAL NOT NULL,
+    started_at       REAL,
+    finished_at      REAL,
+    phase            TEXT,
+    raw_phase        TEXT,
+    step             INTEGER,
+    total_steps      INTEGER,
+    progress         INTEGER,
+    phase_started_at REAL,
+    output_file      TEXT,
+    preview_file     TEXT,
+    log_tail         TEXT,
+    error            TEXT,
+    durations        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS segment (
@@ -116,7 +149,14 @@ CREATE TABLE IF NOT EXISTS worker (
 
 CREATE INDEX IF NOT EXISTS take_status ON take (status);
 CREATE INDEX IF NOT EXISTS take_segment ON take (segment_id);
+CREATE INDEX IF NOT EXISTS keygen_status ON keygen (status);
 """
+
+# Columns added after a table was first created: CREATE TABLE IF NOT EXISTS leaves an existing
+# table alone, so they are added here when missing.
+MIGRATIONS = {
+    "keyframe": {"source_keygen_id": "INTEGER"},
+}
 
 
 def now() -> float:
@@ -132,6 +172,11 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=10000")
     conn.executescript(SCHEMA)
+    for table, columns in MIGRATIONS.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, decl in columns.items():
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
     return conn
 
 

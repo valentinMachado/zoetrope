@@ -1,7 +1,11 @@
 """Operations on jobs, keyframes, segments, takes and assemblies. The API is a thin layer over
 these; the worker only runs takes and assemblies created here.
 
-Keyframes are always uploads (the front extracts frames from a take if the user wants one).
+A keyframe is an upload (the front extracts frames from a take if the user wants one) or the
+result of a keygen: Flux 2 Klein edits the start image with a text instruction, so the keyframe
+keeps the start's identity, framing and background (docs/benchmark.md, "Identity match of a
+keyframe"). A finished keygen replaces the keyframe at its position, technical match applied;
+older keygens stay listed and `use_keygen` puts one back.
 Segment i goes from keyframe i to keyframe i+1 and is kept in sync with the keyframes: internal
 segments are `exact` (their end frame is sent to the model), the last one takes the job's end
 mode (`exact` or `guide`; in guide mode its end keyframe only serves to judge the preview).
@@ -99,7 +103,8 @@ def job_status(conn: sqlite3.Connection, job_id: int) -> str:
     a retained take), or draft."""
     statuses = {r[0] for r in conn.execute(
         "SELECT t.status FROM take t JOIN segment s ON s.id = t.segment_id WHERE s.job_id = ? "
-        "UNION SELECT status FROM assembly WHERE job_id = ?", (job_id, job_id)).fetchall()}
+        "UNION SELECT status FROM assembly WHERE job_id = ? UNION SELECT status FROM keygen WHERE job_id = ?",
+        (job_id, job_id, job_id)).fetchall()}
     if "running" in statuses:
         return "running"
     if "queued" in statuses:
@@ -126,6 +131,8 @@ def job_detail(conn: sqlite3.Connection, job_id: int) -> dict[str, Any]:
     job["segments"] = segments
     job["assemblies"] = [public_assembly(a) for a in db.rows(conn.execute(
         "SELECT * FROM assembly WHERE job_id = ? ORDER BY id", (job_id,)).fetchall())]
+    job["keygens"] = [public_keygen(k) for k in db.rows(conn.execute(
+        "SELECT * FROM keygen WHERE job_id = ? ORDER BY id", (job_id,)).fetchall())]
     return job
 
 
@@ -163,8 +170,10 @@ def _deviations(orig: Image.Image, prepared: Image.Image, params: images.PrepPar
     return {"before": images.deviation(before, start), "after": images.deviation(prepared, start)}
 
 
-def add_keyframe(conn: sqlite3.Connection, job_id: int, position: int, data: bytes) -> dict[str, Any]:
-    """Upload (or replace) the keyframe at `position`; position 0 is the start image."""
+def add_keyframe(conn: sqlite3.Connection, job_id: int, position: int, data: bytes,
+                 source_keygen_id: int | None = None) -> dict[str, Any]:
+    """Upload (or replace) the keyframe at `position`; position 0 is the start image.
+    `source_keygen_id` names the keygen the image comes from, None for an upload."""
     _get(conn, "job", job_id)
     count = conn.execute("SELECT COUNT(*) FROM keyframe WHERE job_id = ?", (job_id,)).fetchone()[0]
     if position < 0 or position > count:
@@ -183,11 +192,12 @@ def add_keyframe(conn: sqlite3.Connection, job_id: int, position: int, data: byt
     with db.transaction(conn):
         conn.execute(
             "INSERT INTO keyframe (job_id, position, orig_file, file, match_applied, match_params, deviation, "
-            "created_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?) ON CONFLICT (job_id, position) DO UPDATE SET "
-            "orig_file = excluded.orig_file, file = excluded.file, match_applied = 0, "
-            "match_params = excluded.match_params, deviation = excluded.deviation, created_at = excluded.created_at",
+            "created_at, source_keygen_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?) ON CONFLICT (job_id, position) "
+            "DO UPDATE SET orig_file = excluded.orig_file, file = excluded.file, match_applied = 0, "
+            "match_params = excluded.match_params, deviation = excluded.deviation, created_at = excluded.created_at, "
+            "source_keygen_id = excluded.source_keygen_id",
             (job_id, position, str(orig_file), str(file), json.dumps(params.to_json()),
-             json.dumps(deviation) if deviation else None, db.now()),
+             json.dumps(deviation) if deviation else None, db.now(), source_keygen_id),
         )
         _sync_segments(conn, job_id)
     if position == 0:
@@ -265,6 +275,75 @@ def public_keyframe(k: dict[str, Any]) -> dict[str, Any]:
     # Changes whenever the prepared image is rewritten (upload, match): the front's cache buster.
     k["version"] = Path(file).stat().st_mtime_ns if Path(file).is_file() else 0
     return k
+
+
+# --- keygens: keyframes generated from the start image ------------------------------------------
+
+
+def create_keygen(conn: sqlite3.Connection, job_id: int, position: int, instruction: str, *,
+                  seed: int | None = None, preset: str = presets.KEYFRAME) -> dict[str, Any]:
+    """Queue the generation of the keyframe at `position` (an existing one, replaced when the
+    keygen finishes, or the next one) by editing the start image with `instruction`. The start
+    image is snapshotted: changing it later does not change this keygen."""
+    _get(conn, "job", job_id)
+    count = conn.execute("SELECT COUNT(*) FROM keyframe WHERE job_id = ?", (job_id,)).fetchone()[0]
+    if count == 0:
+        raise Invalid("The job has no start image")
+    if position < 1 or position > count:
+        raise Invalid(f"A generated keyframe goes at a position between 1 and {count}")
+    if not instruction.strip():
+        raise Invalid("The instruction is empty")
+    try:
+        p = presets.load(preset)
+    except presets.PresetError as e:
+        raise Invalid(str(e)) from None
+    if p.tier != "keyframe":
+        raise Invalid(f"Preset {preset} is not a keyframe preset")
+    start = conn.execute("SELECT file FROM keyframe WHERE job_id = ? AND position = 0", (job_id,)).fetchone()[0]
+    seed = presets.new_seed() if seed is None else int(seed)
+    with db.transaction(conn):
+        cur = conn.execute(
+            "INSERT INTO keygen (job_id, position, instruction, preset, model_type, memory_profile, settings, seed, "
+            "status, created_at) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, 'queued', ?)",
+            (job_id, position, instruction.strip(), preset, p.model_type, p.memory_profile, seed, db.now()),
+        )
+        gen_id = cur.lastrowid
+        d = paths.keygens_dir(job_id)
+        d.mkdir(parents=True, exist_ok=True)
+        start_copy = d / f"{gen_id}_start.png"
+        shutil.copyfile(start, start_copy)
+        with Image.open(start_copy) as im:
+            size = im.size
+        try:
+            settings = presets.build_keygen_settings(p, instruction=instruction, image=start_copy,
+                                                     image_size=size, seed=seed)
+        except presets.PresetError as e:
+            raise Invalid(str(e)) from None
+        (d / f"{gen_id}.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        db.update(conn, "keygen", gen_id, settings=json.dumps(settings))
+    return public_keygen(_get(conn, "keygen", gen_id))
+
+
+def use_keygen(conn: sqlite3.Connection, gen_id: int) -> dict[str, Any]:
+    """Make a finished keygen's image the keyframe at its position, with the technical match
+    (fit and colour match on the start image, the start's background). The worker calls it when
+    a keygen finishes; the user calls it to go back to an older one."""
+    g = _get(conn, "keygen", gen_id)
+    if g["status"] != "done" or not g["output_file"] or not Path(g["output_file"]).is_file():
+        raise Invalid(f"Keygen {gen_id} has no image")
+    k = add_keyframe(conn, g["job_id"], g["position"], Path(g["output_file"]).read_bytes(), source_keygen_id=gen_id)
+    background = "#" + "".join(f"{c:02x}" for c in _start_params(conn, g["job_id"]).background)
+    return match_keyframe(conn, k["id"], enabled=True, background=background)
+
+
+def public_keygen(g: dict[str, Any]) -> dict[str, Any]:
+    g = dict(g)
+    g["settings"] = db.loads(g["settings"], {})
+    g["durations"] = db.loads(g["durations"])
+    g["output_url"] = paths.to_url(g.pop("output_file"))
+    g["preview_url"] = paths.to_url(g.pop("preview_file"))
+    g["log_tail"] = (g["log_tail"] or "").splitlines()
+    return g
 
 
 # --- segments -----------------------------------------------------------------------------------
@@ -402,7 +481,7 @@ def cancel(conn: sqlite3.Connection, table: str, row_id: int) -> dict[str, Any]:
         else:
             raise Invalid(f"{table} {row_id} is already {r['status']}")
     r = _get(conn, table, row_id)
-    return public_take(r) if table == "take" else public_assembly(r)
+    return {"take": public_take, "keygen": public_keygen, "assembly": public_assembly}[table](r)
 
 
 def get_take(conn: sqlite3.Connection, take_id: int) -> dict[str, Any]:
@@ -480,6 +559,9 @@ def queue_state(conn: sqlite3.Connection) -> dict[str, Any]:
         if item["kind"] == "take":
             seg = _get(conn, "segment", r["segment_id"])
             item.update(job_id=seg["job_id"], segment_idx=seg["idx"], tier=r["tier"], preset=r["preset"],
+                        phase=r["phase"], step=r["step"], total_steps=r["total_steps"], progress=r["progress"])
+        elif item["kind"] == "keygen":
+            item.update(job_id=r["job_id"], position=r["position"], tier="keyframe", preset=r["preset"],
                         phase=r["phase"], step=r["step"], total_steps=r["total_steps"], progress=r["progress"])
         else:
             item.update(job_id=r["job_id"], phase=r["phase"])

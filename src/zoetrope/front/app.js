@@ -118,7 +118,7 @@ const PHASE_LABELS = {
   inference: "génération", decoding: "décodage", saving: "enregistrement",
 };
 
-const TIER_LABELS = { preview: "aperçu", final: "rendu final" };
+const TIER_LABELS = { preview: "aperçu", final: "rendu final", keyframe: "image créée" };
 
 // Folded block whose open state survives the rebuilds of its card (a polled take is rebuilt
 // every few seconds).
@@ -275,7 +275,8 @@ function renderTopbar(error) {
   const q = state.queue;
   if (w.alive) {
     const cur = w.current_kind
-      ? (w.current_kind === "take" ? `rend la prise #${w.current_id}` : `monte (montage ${w.current_id})`)
+      ? ({ take: `rend la prise #${w.current_id}`, keygen: `crée une image (création #${w.current_id})` }[w.current_kind] ||
+        `monte (montage ${w.current_id})`)
       : "prêt, rien à faire";
     pill.className = "pill ok";
     pill.textContent = `Moteur de rendu : ${cur}`;
@@ -307,7 +308,7 @@ function renderQueuePanel() {
   const rows = state.queue.items.map((i) => {
     const what = i.kind === "take"
       ? `plan ${i.segment_idx + 1} · ${TIER_LABELS[i.tier] || i.tier} (prise #${i.id})`
-      : `montage ${i.id}`;
+      : i.kind === "keygen" ? `création de l'image ${i.position} (#${i.id})` : `montage ${i.id}`;
     let where = "";
     if (i.status === "running") {
       where = PHASE_LABELS[i.phase] || i.phase || "démarrage";
@@ -330,7 +331,7 @@ function renderQueuePanel() {
     rows.length ? h("ol", {}, rows) : h("p", {}, "Rien en attente."),
     rows.length ? h("p", { class: "muted" }, `Tout sera fini dans ${fmtDuration(state.queue.total_s)} environ.`) : null,
     h("p", { class: "muted small" },
-      "Ordre : les aperçus d'abord, puis les montages, puis les rendus finaux regroupés par modèle " +
+      "Ordre : les aperçus et les images créées d'abord, puis les montages, puis les rendus finaux regroupés par modèle " +
       "(changer de modèle le recharge). Tu peux fermer la page : les rendus continuent."),
   );
   panel.scrollTop = top;
@@ -436,6 +437,16 @@ function findNextStep(job) {
   if (!job.keyframes.length) {
     return { text: "Dépose l'image de départ (photo, aquarelle, dessin) à l'étape 1.", target: "add-kf" };
   }
+  const liveGen = job.keygens.find(isLive);
+  if (liveGen) {
+    const q = queueItem("keygen", liveGen.id);
+    const when = liveGen.status === "running"
+      ? `en cours${q ? `, encore ${fmtDuration(q.remaining_s)} environ` : ""}`
+      : `en attente${q ? `, commence dans ${fmtDuration(q.starts_in_s)}` : ""}`;
+    return { text: `Création de l'image ${liveGen.position} depuis l'image de départ ${when}.` +
+      (state.queue.worker.alive ? "" : " Le moteur de rendu est arrêté : lance scripts\\start-worker.ps1."),
+    target: `keygen-${liveGen.id}`, wait: true };
+  }
   const multi = job.segments.length > 1;
   const name = (s) => (multi ? `du plan ${s.idx + 1}` : "");
   let waiting = null;
@@ -539,7 +550,8 @@ function renderJob() {
     const images = section("step-images", "1", "Images",
       "L'image de départ est le premier plan de la vidéo. Une 2ᵉ image, facultative, impose la fin : " +
       "le rendu final arrivera dessus. Avec plusieurs images, la vidéo a un plan entre chaque paire.");
-    images.append(h("div", { class: "keyframes" }));
+    images.append(h("div", { class: "keyframes" }),
+      h("div", { class: "card keygen" }, h("div", { class: "keygen-form" }), h("div", { class: "keygen-list" })));
     const shots = section("step-shots", "2-4", "Plans : aperçu, rendu final, prise à garder",
       "Pour chaque plan : décris le mouvement, vérifie-le avec un aperçu rapide, lance le rendu final " +
       "quand il te va, puis garde la prise qui te plaît.");
@@ -561,6 +573,7 @@ function renderJob() {
   syncList(kfs, [...job.keyframes, { id: "add" }], (k) => k.id,
     (k) => k.id === "add" ? `add${job.keyframes.length}` : JSON.stringify([k, job.keyframes.length]),
     (k) => k.id === "add" ? renderAddKeyframe(job) : renderKeyframe(job, k));
+  updateKeygens(view, job);
   syncList(view.querySelector(".segments"), job.segments, (s) => s.id,
     (s) => JSON.stringify([s.id, s.kf_in, s.kf_out, s.end_mode, job.preset_final, job.segments.length,
       kfVersions(job, s)]),
@@ -656,8 +669,8 @@ function renderAddKeyframe(job) {
         : `Image ${n} (facultatif)`),
       h("div", { class: "muted small" },
         n === 0 ? "photo, aquarelle, dessin ; une image détourée (transparence) est posée sur un fond uni"
-          : "le rendu final arrivera sur cette image. Tu peux aussi en prendre une dans une prise, plus bas " +
-            "(« Utiliser cette image »)."),
+          : "le rendu final arrivera sur cette image. Tu peux aussi la créer depuis l'image de départ (juste " +
+            "en dessous) ou en prendre une dans une prise (« Utiliser cette image »)."),
       filePicker(upload, "Choisir un fichier", n === 0 ? "primary" : ""))), upload);
 }
 
@@ -672,7 +685,10 @@ function renderKeyframe(job, k) {
   const title = isStart ? "Image de départ" : isLast ? `Image ${k.position} · fin` : `Image ${k.position}`;
   const card = h("div", { class: "kf" + (isStart ? " start" : "") },
     h("div", { class: "kf-title" }, title,
-      !isStart && k.match_applied ? h("span", { class: "badge s-done", title: "Ajustée sur l'image de départ" }, "ajustée") : null),
+      h("span", {},
+        k.source_keygen_id ? h("span", { class: "badge generated", title: `Créée depuis l'image de départ ` +
+          `(génération #${k.source_keygen_id}, plus bas)` }, "créée") : null,
+        !isStart && k.match_applied ? h("span", { class: "badge s-done", title: "Ajustée sur l'image de départ" }, "ajustée") : null)),
     h("img", { src: kfUrl(k), alt: kfName(k), title: "Agrandir", onclick: () => openCompare(job, k) }),
     isStart ? null : matchButtons(k, bg),
     h("div", { class: "row small-buttons" },
@@ -751,6 +767,166 @@ function openCompare(job, k) {
       "sa dérive d'identité (visage, âge) : le modèle 14B la reproduit à la fin du plan.")));
 }
 
+// --- prompt help --------------------------------------------------------------------------------
+//
+// Folded « Conseils » under a text field: what worked in the measures (docs/benchmark.md: P8 for
+// the keygen instruction; P9 notes for the motion prompt), plus examples that fill the field.
+
+function promptTips(key, field, tips, examples) {
+  const use = (text) => {
+    field.value = text;
+    field.dispatchEvent(new Event("input"));
+    field.dispatchEvent(new Event("change"));
+    field.focus();
+  };
+  return fold(`tips-${key}`, "adv", "Conseils pour bien l'écrire",
+    h("ul", { class: "tips" }, tips.map((t) => h("li", {}, t))),
+    h("div", { class: "tips-examples" }, h("span", { class: "muted" }, "Exemples (clic pour reprendre) :"),
+      examples.map((e) => h("button", { type: "button", class: "link", title: "Mettre cet exemple dans le champ",
+        onclick: () => use(e) }, `« ${e} »`))));
+}
+
+const MOTION_TIPS = [
+  "En anglais : les modèles vidéo le suivent mieux qu'en français.",
+  "Décris l'image, puis ce qui bouge, dans l'ordre : sujet, mouvement, caméra. Ex. « … smiles, then winks. Static camera ».",
+  "Nomme le style s'il n'est pas photo (« a watercolor painting, loose wet brushstrokes, paper texture ») : sans ça, " +
+    "une aquarelle ou un dessin vire vite à la photo.",
+  "Un ou deux mouvements par plan, pas une histoire : 2 à 3 s, c'est court. Pour une suite d'actions, ajoute des images et des plans.",
+  "Dis ce qui ne bouge pas (« static camera », « plain white background ») pour éviter les mouvements parasites.",
+  "Avec une image de fin, décris le chemin vers elle : le rendu final y arrive de toute façon.",
+];
+
+const MOTION_EXAMPLES = [
+  "The man smiles warmly, slowly closes his eyes and lowers his head slightly. Subtle natural facial motion, static camera, plain white background.",
+  "A watercolor painting of a woman's face, loose wet brushstrokes, paint splashes on white paper. She slowly smiles, then winks. Static camera.",
+  "The boats rock gently on the water, light shimmers on the waves, clouds drift slowly. Static camera.",
+];
+
+const KEYGEN_TIPS = [
+  "En anglais de préférence (c'est ce qui a été mesuré).",
+  "Une consigne d'édition : ce qui change, au présent ou à l'impératif (« Make him close his eyes and smile widely »). " +
+    "Pas besoin de redécrire l'image.",
+  "Le visage, le cadrage, le style et le fond sont gardés tout seuls : une phrase qui le demande est ajoutée à ta consigne.",
+  "L'expression et le regard sont bien suivis ; un mouvement de tête ou de corps l'est mal (« lower his head » ignoré en P8).",
+  "Reste proche de l'image de départ : c'est la fin du plan, le modèle vidéo devra y arriver en 2 à 3 s.",
+  "Résultat moyen ? « Autre tirage » relance avec une autre graine, puis garde la meilleure (« Utiliser celle-ci »).",
+];
+
+const KEYGEN_EXAMPLES = [
+  "Make the man close his eyes, smile widely and warmly.",
+  "Make her look to the left with a surprised expression, mouth slightly open.",
+  "Make him laugh, eyes squinting, mouth open.",
+];
+
+// --- keygens: a keyframe created from the start image (Flux 2 Klein) -----------------------------
+//
+// The model edits the start image with a text instruction, so the result keeps the start's face,
+// framing and background (docs/benchmark.md, P8). When it finishes, the backend makes it the
+// keyframe at its position (technical match applied); older ones stay listed and can be used again.
+
+const keygenDrafts = new Map(); // job id -> instruction being typed, survives the form's rebuilds
+
+function keygenTargets(job) {
+  const n = job.keyframes.length;
+  const opts = [];
+  for (let i = n - 1; i >= 1; i--) opts.push([i, i === n - 1 ? `à la place de l'image ${i} (fin)` : `à la place de l'image ${i}`]);
+  opts.push([n, n === 1 ? "comme image de fin" : `comme nouvelle image ${n}`]);
+  return opts;
+}
+
+function renderKeygenForm(job) {
+  if (!job.keyframes.length) return [];
+  const instruction = h("textarea", { class: "prompt", rows: 2, dataset: { next: "keygen" },
+    placeholder: "ex. « Make her close her eyes and smile widely » ; ce qui ne change pas est gardé",
+    oninput: (ev) => keygenDrafts.set(job.id, ev.target.value) });
+  instruction.value = keygenDrafts.get(job.id) || "";
+  const target = h("select", {}, keygenTargets(job).map(([pos, label]) => h("option", { value: pos }, label)));
+  const go = async () => {
+    if (!instruction.value.trim()) { toast("Écris d'abord ce qui doit changer."); return; }
+    const g = await act(() => api("POST", `/jobs/${job.id}/keygens`,
+      { position: Number(target.value), instruction: instruction.value }));
+    if (g) toast(`Création de l'image ${g.position} lancée (~40 s).`, false);
+  };
+  const est = estimate(preset("keyframe-klein") || {});
+  return [
+    h("h3", {}, "Créer une image depuis le départ"),
+    h("p", { class: "muted small" },
+      "Pour une image de fin qui garde le visage, le cadrage et le fond de l'image de départ : écris ce qui change ",
+      "(expression, regard, geste) et un modèle d'image (Flux 2 Klein) modifie l'image de départ. ",
+      "Mieux qu'une image prise dans un aperçu, qui dérive (visage, âge). Consigne en anglais de préférence."),
+    h("div", { class: "keygen-row" }, instruction,
+      h("div", { class: "keygen-actions" }, target,
+        h("button", { type: "button", class: "primary", onclick: go },
+          `Créer l'image${est ? ` (~${fmtDuration(est)})` : ""}`))),
+    promptTips(`keygen-${job.id}`, instruction, KEYGEN_TIPS, KEYGEN_EXAMPLES),
+  ];
+}
+
+function keygenStartUrl(g) { // the start image as it was when the keygen was created
+  return g.output_url ? g.output_url.replace(/(\d+)\.png$/, "$1_start.png") : null;
+}
+
+function isCurrentKeygen(job, g) {
+  return job.keyframes.some((k) => k.position === g.position && k.source_keygen_id === g.id);
+}
+
+function renderKeygen(job, g) {
+  const q = queueItem("keygen", g.id);
+  const current = isCurrentKeygen(job, g);
+  const again = () => act(() => api("POST", `/jobs/${job.id}/keygens`, { position: g.position, instruction: g.instruction }));
+  const head = h("div", { class: "take-head" },
+    h("strong", {}, `Création #${g.id}`), " ", h("span", { class: "tier keyframe" }, `image ${g.position}`), " ", badge(g.status),
+    current ? h("span", { class: "badge retained" }, `c'est l'image ${g.position}`) : null,
+    h("span", { class: "muted small", title: g.preset }, ` graine ${g.seed} · ${g.settings.resolution || ""}`),
+    h("span", { class: "spacer" }),
+    isLive(g)
+      ? h("button", { type: "button", class: "danger", onclick: () => act(() => api("POST", `/keygens/${g.id}/cancel`)) },
+        g.cancel_requested ? "annulation…" : "Annuler")
+      : [g.status === "done" && !current
+        ? h("button", { type: "button", title: `Remet cette image comme image ${g.position}`,
+          onclick: () => act(() => api("POST", `/keygens/${g.id}/use`)) }, "Utiliser celle-ci") : null,
+      h("button", { type: "button", title: "Même consigne, autre tirage (graine)", onclick: again }, "Autre tirage")]);
+  const body = [h("p", { class: "keygen-instruction" }, `« ${g.instruction} »`)];
+  if (g.status === "queued") {
+    body.push(h("p", { class: "muted" }, q ? `En file : commence dans ${fmtDuration(q.starts_in_s)} environ, ` +
+      `dure ${fmtDuration(q.remaining_s)}.` : "En file."));
+  } else if (g.status === "running") {
+    body.push(renderProgress(g, q));
+  } else if (g.status === "done" && g.output_url) {
+    const fig = (src, caption) => h("figure", {}, h("img", { src, title: "Agrandir",
+      onclick: () => openKeygenCompare(g) }), h("figcaption", {}, caption));
+    body.push(h("div", { class: "keygen-pair" },
+      fig(keygenStartUrl(g), "image de départ"), fig(g.output_url, "image créée")));
+    if (g.durations) body.push(h("p", { class: "muted small" }, `Créée en ${fmtDuration(g.durations.total)}, le ${fmtDate(g.finished_at)}.`));
+    if (g.error) body.push(h("p", { class: "muted small" }, g.error));
+  } else if (g.status === "failed") {
+    body.push(h("pre", { class: "error" }, g.error || "échec"));
+  }
+  if (g.log_tail.length && g.status !== "done") {
+    body.push(fold(`klog-${g.id}`, "", "Journal", h("pre", { class: "log" }, g.log_tail.join("\n"))));
+  }
+  return h("div", { class: `take ${g.status}${current ? " is-retained" : ""}`, dataset: { next: `keygen-${g.id}` } }, head, body);
+}
+
+function openKeygenCompare(g) {
+  const fig = (src, caption) => h("figure", {}, h("img", { src }), h("figcaption", {}, caption));
+  openModal(h("div", {},
+    h("h3", {}, `Création #${g.id} : image ${g.position}`),
+    h("p", {}, `« ${g.instruction} »`),
+    h("div", { class: "compare" }, fig(keygenStartUrl(g), "Image de départ"), fig(g.output_url, "Image créée"))));
+}
+
+function updateKeygens(view, job) {
+  view.querySelector(".keygen").hidden = !job.keyframes.length;
+  syncOne(view.querySelector(".keygen-form"), JSON.stringify([job.id, job.keyframes.length, state.presets.length]),
+    renderKeygenForm);
+  syncList(view.querySelector(".keygen-list"), [...job.keygens].reverse(), (g) => g.id, (g) => {
+    const q = queueItem("keygen", g.id);
+    return JSON.stringify([g.status, g.phase, g.step, g.progress, g.preview_url, g.output_url, g.error,
+      g.cancel_requested, isCurrentKeygen(job, g), isLive(g) ? [q?.starts_in_s, Math.round(q?.remaining_s / 5)] : 0]);
+  }, (g) => renderKeygen(job, g));
+}
+
 function openModal(content) {
   const m = document.getElementById("modal");
   m.replaceChildren(h("div", { class: "modal-box" },
@@ -825,6 +1001,7 @@ function renderSegment(job, s) {
         thumb(kout, s.kf_out === null ? "fin libre" : s.end_mode === "guide" ? "fin indicative" : "fin")),
       h("div", { class: "seg-form" },
         h("label", {}, "Que se passe-t-il ? (prompt)", prompt),
+        promptTips(`seg-${s.id}`, prompt, MOTION_TIPS, MOTION_EXAMPLES),
         h("div", { class: "row" },
           h("label", { class: "inline" }, "Durée (s)", duration),
           h("span", { class: "spacer" }),

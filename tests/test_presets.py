@@ -45,3 +45,23 @@ def test_no_end_frame_on_5b_and_style_appended():
 def test_profile_override_format():
     assert presets.profile_override(4) == "memory_profile=4"
     assert presets.profile_override(4.5) == "memory_profile=4.5"
+
+
+def test_keygen_resolution_keeps_the_start_aspect_within_the_budget():
+    assert presets.fit_resolution("480x512", (480, 510)) == "480x512"
+    w, h = (int(v) for v in presets.fit_resolution("480x512", (544, 736)).split("x"))
+    assert w % 16 == 0 and h % 16 == 0
+    assert abs(w / h - 544 / 736) < 0.03 and abs(w * h - 480 * 512) / (480 * 512) < 0.06
+
+
+def test_build_keygen_settings():
+    p = presets.load(presets.KEYFRAME)
+    assert p.tier == "keyframe" and p.model_type == "flux2_klein_4b"
+    s = presets.build_keygen_settings(p, instruction="Make her smile.", image=Path("s.png"),
+                                      image_size=(480, 510), seed=3)
+    assert s["image_refs"] == ["s.png"] and s["video_prompt_type"] == "KI" and s["image_mode"] == 1
+    assert s["prompt"].startswith("Make her smile. Keep the same person")
+    assert s["seed"] == 3 and s["resolution"] == "480x512" and s["num_inference_steps"] == 4
+    with pytest.raises(presets.PresetError):
+        presets.build_keygen_settings(presets.load("preview"), instruction="x", image=Path("s"),
+                                      image_size=(1, 1), seed=1)

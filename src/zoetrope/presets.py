@@ -5,6 +5,11 @@ queue needs: its tier (preview or final), whether the model takes an end frame, 
 the memory profile, and measured phase durations used for the time-remaining estimate until real
 takes of the preset exist. A take snapshots the settings resolved here: editing a preset later
 does not change past takes.
+
+A `keyframe` preset (tier "keyframe", Flux 2 Klein) generates a keyframe by editing the start image
+with a text instruction (docs/benchmark.md, "Identity match of a keyframe"). Its `resolution` is a
+pixel budget: the output takes the start image's aspect ratio within it. Its `prompt_suffix`
+follows the user's instruction and asks the model to keep what must not change.
 """
 
 from __future__ import annotations
@@ -19,6 +24,8 @@ from . import paths
 
 PREVIEW = "preview"
 DEFAULT_FINAL = "final-14b"
+KEYFRAME = "keyframe-klein"
+TIERS = ("preview", "final", "keyframe")
 
 
 class PresetError(ValueError):
@@ -38,6 +45,7 @@ class Preset:
     loras: list[dict[str, Any]] = field(default_factory=list)
     estimates: dict[str, float] = field(default_factory=dict)
     notes: str = ""
+    prompt_suffix: str = ""
 
     @property
     def model_type(self) -> str:
@@ -58,7 +66,10 @@ def load(name: str, directory: Path | None = None) -> Preset:
     if not file.is_file():
         raise PresetError(f"Unknown preset: {name}")
     data = json.loads(file.read_text(encoding="utf-8"))
-    return Preset(name=name, **data)
+    preset = Preset(name=name, **data)
+    if preset.tier not in TIERS:
+        raise PresetError(f"Preset {name}: unknown tier {preset.tier!r}")
+    return preset
 
 
 def list_presets(directory: Path | None = None) -> list[Preset]:
@@ -114,4 +125,39 @@ def build_settings(
             raise PresetError(f"Missing LoRA file(s): {', '.join(missing)}")
         settings["activated_loras"] = [str(f) for f in files]
         settings["loras_multipliers"] = " ".join(str(lora.get("weight", 1.0)) for lora in preset.loras)
+    return settings
+
+
+def fit_resolution(budget: str, size: tuple[int, int], block: int = 16) -> str:
+    """A WxH resolution with the aspect ratio of `size` and about the pixel count of `budget`
+    ("480x512"), both sides multiples of `block`."""
+    bw, bh = (int(v) for v in budget.lower().split("x"))
+    w, h = size
+    scale = ((bw * bh) / (w * h)) ** 0.5
+    return f"{max(block, round(w * scale / block) * block)}x{max(block, round(h * scale / block) * block)}"
+
+
+def build_keygen_settings(
+    preset: Preset,
+    *,
+    instruction: str,
+    image: Path,
+    image_size: tuple[int, int],
+    seed: int,
+) -> dict[str, Any]:
+    """Settings sent to Wan2GP to edit the start image `image` with a text instruction."""
+    if preset.tier != "keyframe":
+        raise PresetError(f"Preset {preset.name} is not a keyframe preset")
+    prompt = instruction.strip()
+    if preset.prompt_suffix:
+        sep = " " if prompt.endswith((".", "!", "?")) else ". "
+        prompt = f"{prompt}{sep}{preset.prompt_suffix}" if prompt else preset.prompt_suffix
+    settings: dict[str, Any] = dict(preset.settings)
+    settings.update(
+        prompt=prompt,
+        image_refs=[str(image)],
+        resolution=fit_resolution(preset.settings.get("resolution", "480x512"), image_size),
+        seed=int(seed),
+        overrides=profile_override(preset.memory_profile),
+    )
     return settings

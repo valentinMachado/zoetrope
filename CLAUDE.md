@@ -44,11 +44,13 @@ Two processes that talk only through `outputs/zoetrope.db` (SQLite, WAL):
 
 The front (`src/zoetrope/front/`: one HTML page, plain JS, no build step) polls the API and
 only rebuilds the parts whose data changed, so a playing video or a prompt being typed survives
-a refresh. Frames are extracted in the browser (canvas) and uploaded as keyframes. The job page
+a refresh. Frames are extracted in the browser (canvas) and uploaded as keyframes; a keyframe can
+also be created from the start image by Flux 2 Klein and a text instruction (a "keygen", a task of
+the worker's queue, preset `keyframe-klein`), which keeps the start's identity. The job page
 follows the user's path in five steps and says what to do next from the job's state
 (`nextStep()` in `app.js`); fine settings sit in folded « Avancé » blocks.
 
-Queue order, take/assembly lifecycle and keyframe preparation are documented in the module
+Queue order, take/keygen/assembly lifecycle and keyframe preparation are documented in the module
 docstrings (`queue.py`, `service.py`, `worker.py`, `images.py`, `assembly.py`).
 
 ## Commands

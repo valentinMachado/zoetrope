@@ -35,6 +35,10 @@ def keyframes_dir(job_id: int) -> Path:
     return job_dir(job_id) / "keyframes"
 
 
+def keygens_dir(job_id: int) -> Path:
+    return keyframes_dir(job_id) / "gen"
+
+
 def takes_dir(job_id: int) -> Path:
     return job_dir(job_id) / "takes"
 

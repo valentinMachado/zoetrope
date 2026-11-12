@@ -67,8 +67,14 @@ class FakeJob:
             e.close()
             return
         e.put("progress", _progress("decoding"))
-        out = paths.wan2gp_output_dir() / "clip.mp4"
-        _clip(out, (180, 90, 60))
+        if self.settings.get("image_mode"):  # an image model (Klein): a jpg, sized by `resolution`
+            w, h = (int(v) for v in self.settings["resolution"].split("x"))
+            out = paths.wan2gp_output_dir() / f"image_{self.settings['seed']}.jpg"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (w, h), (90, 160, 200)).save(out, "JPEG")
+        else:
+            out = paths.wan2gp_output_dir() / "clip.mp4"
+            _clip(out, (180, 90, 60))
         self.files = [str(out)]
         e.close()
 
@@ -182,3 +188,41 @@ def test_assembly_fails_cleanly_on_missing_file(conn):
     Worker(conn, session_factory=FakeSession).run_next()
     r = conn.execute("SELECT status, error FROM assembly WHERE id = ?", (a["id"],)).fetchone()
     assert r[0] == "failed" and "missing" in r[1]
+
+
+def test_keygen_replaces_the_keyframe_and_an_older_one_can_be_used_again(conn):
+    job, _ = _job(conn, n_kf=2)
+    g1 = service.create_keygen(conn, job["id"], 1, "Make him smile.", seed=1)
+    g2 = service.create_keygen(conn, job["id"], 2, "Close the eyes.", seed=2)  # appends keyframe 2
+    w = Worker(conn, session_factory=FakeSession)
+    assert w.run_next() and w.run_next()
+    assert w.loaded == ("flux2_klein_4b", 4.0)
+    detail = service.job_detail(conn, job["id"])
+    kfs = {k["position"]: k for k in detail["keyframes"]}
+    assert kfs[1]["source_keygen_id"] == g1["id"] and kfs[2]["source_keygen_id"] == g2["id"]
+    assert kfs[1]["match_applied"] == 1
+    assert len(detail["segments"]) == 2
+    gens = {g["id"]: g for g in detail["keygens"]}
+    assert gens[g1["id"]]["status"] == "done" and gens[g1["id"]]["output_url"].endswith(f"gen/{g1['id']}.png")
+    start = Image.open(paths.keyframes_dir(job["id"]) / "0.png")
+    assert Image.open(paths.keyframes_dir(job["id"]) / "1.png").size == start.size
+    assert not list(paths.wan2gp_output_dir().glob("*.jpg"))
+
+    g3 = service.create_keygen(conn, job["id"], 1, "Make him smile.", seed=3)
+    assert w.run_next()
+    assert service.job_detail(conn, job["id"])["keyframes"][1]["source_keygen_id"] == g3["id"]
+    k = service.use_keygen(conn, g1["id"])
+    assert k["source_keygen_id"] == g1["id"] and k["match_applied"] == 1
+    # an upload clears the link to the keygen
+    k = service.add_keyframe(conn, job["id"], 1, png_bytes(portrait()))
+    assert k["source_keygen_id"] is None
+
+
+def test_keygen_whose_position_is_gone_stays_done_with_the_reason(conn):
+    job, _ = _job(conn, n_kf=2)
+    g = service.create_keygen(conn, job["id"], 2, "Wave.", seed=1)  # would append keyframe 2
+    last = service.job_detail(conn, job["id"])["keyframes"][1]
+    service.delete_keyframe(conn, last["id"])  # position 2 is no longer next to an existing keyframe
+    Worker(conn, session_factory=FakeSession).run_next()
+    row = db.row(conn.execute("SELECT * FROM keygen WHERE id = ?", (g["id"],)).fetchone())
+    assert row["status"] == "done" and "Not installed" in row["error"]
