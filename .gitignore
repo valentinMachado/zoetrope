@@ -1,0 +1,19 @@
+# Python environments
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Model weights and generated media: far too large to track.
+models/*
+!models/.gitkeep
+loras/*
+!loras/.gitkeep
+outputs/*
+!outputs/.gitkeep
+
+# Third-party tools cloned locally (Wan2GP, later ComfyUI), each with its own venv.
+tools/
+
+# Local-only steering notes, in French.
+management/
