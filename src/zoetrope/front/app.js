@@ -308,7 +308,7 @@ function renderQueuePanel() {
   const rows = state.queue.items.map((i) => {
     const what = i.kind === "take"
       ? `plan ${i.segment_idx + 1} · ${TIER_LABELS[i.tier] || i.tier} (prise #${i.id})`
-      : i.kind === "keygen" ? `création de l'image ${i.position} (#${i.id})` : `montage ${i.id}`;
+      : i.kind === "keygen" ? `création de l'${posName(i.position)} (#${i.id})` : `montage ${i.id}`;
     let where = "";
     if (i.status === "running") {
       where = PHASE_LABELS[i.phase] || i.phase || "démarrage";
@@ -434,18 +434,19 @@ function nextStep(job) {
 }
 
 function findNextStep(job) {
-  if (!job.keyframes.length) {
-    return { text: "Dépose l'image de départ (photo, aquarelle, dessin) à l'étape 1.", target: "add-kf" };
-  }
   const liveGen = job.keygens.find(isLive);
   if (liveGen) {
     const q = queueItem("keygen", liveGen.id);
     const when = liveGen.status === "running"
       ? `en cours${q ? `, encore ${fmtDuration(q.remaining_s)} environ` : ""}`
       : `en attente${q ? `, commence dans ${fmtDuration(q.starts_in_s)}` : ""}`;
-    return { text: `Création de l'image ${liveGen.position} depuis l'image de départ ${when}.` +
+    return { text: `Création de l'${posName(liveGen.position)} ${when}.` +
       (state.queue.worker.alive ? "" : " Le moteur de rendu est arrêté : lance scripts\\start-worker.ps1."),
     target: `keygen-${liveGen.id}`, wait: true };
+  }
+  if (!job.keyframes.length) {
+    return { text: "Dépose l'image de départ (photo, aquarelle, dessin) à l'étape 1, ou crée-la juste en dessous.",
+      target: "add-kf" };
   }
   const multi = job.segments.length > 1;
   const name = (s) => (multi ? `du plan ${s.idx + 1}` : "");
@@ -669,8 +670,8 @@ function renderAddKeyframe(job) {
         : `Image ${n} (facultatif)`),
       h("div", { class: "muted small" },
         n === 0 ? "photo, aquarelle, dessin ; une image détourée (transparence) est posée sur un fond uni"
-          : "le rendu final arrivera sur cette image. Tu peux aussi la créer depuis l'image de départ (juste " +
-            "en dessous) ou en prendre une dans une prise (« Utiliser cette image »)."),
+          : "le rendu final arrivera sur cette image. Tu peux aussi la créer (juste en dessous) " +
+            "ou en prendre une dans une prise (« Utiliser cette image »)."),
       filePicker(upload, "Choisir un fichier", n === 0 ? "primary" : ""))), upload);
 }
 
@@ -686,8 +687,8 @@ function renderKeyframe(job, k) {
   const card = h("div", { class: "kf" + (isStart ? " start" : "") },
     h("div", { class: "kf-title" }, title,
       h("span", {},
-        k.source_keygen_id ? h("span", { class: "badge generated", title: `Créée depuis l'image de départ ` +
-          `(génération #${k.source_keygen_id}, plus bas)` }, "créée") : null,
+        k.source_keygen_id ? h("span", { class: "badge generated", title: `Créée par Flux 2 Klein ` +
+          `(création #${k.source_keygen_id}, plus bas)` }, "créée") : null,
         !isStart && k.match_applied ? h("span", { class: "badge s-done", title: "Ajustée sur l'image de départ" }, "ajustée") : null)),
     h("img", { src: kfUrl(k), alt: kfName(k), title: "Agrandir", onclick: () => openCompare(job, k) }),
     isStart ? null : matchButtons(k, bg),
@@ -770,7 +771,7 @@ function openCompare(job, k) {
 // --- prompt help --------------------------------------------------------------------------------
 //
 // Folded « Conseils » under a text field: what worked in the measures (docs/benchmark.md: P8 for
-// the keygen instruction; P9 notes for the motion prompt), plus examples that fill the field.
+// the keygen prompt; P9 notes for the motion prompt), plus examples that fill the field.
 
 function promptTips(key, field, tips, examples) {
   const use = (text) => {
@@ -804,99 +805,230 @@ const MOTION_EXAMPLES = [
 
 const KEYGEN_TIPS = [
   "En anglais de préférence (c'est ce qui a été mesuré).",
-  "Une consigne d'édition : ce qui change, au présent ou à l'impératif (« Make him close his eyes and smile widely »). " +
-    "Pas besoin de redécrire l'image.",
-  "Le visage, le cadrage, le style et le fond sont gardés tout seuls : une phrase qui le demande est ajoutée à ta consigne.",
+  "Depuis une image : une consigne d'édition, ce qui change, à l'impératif (« Make him close his eyes and smile " +
+    "widely »). Pas besoin de redécrire l'image : une phrase qui demande de garder le reste est ajoutée.",
+  "Le visage n'est gardé que si l'image source principale (la 1re) est l'image de départ. Depuis une autre image, " +
+    "ou du texte seul, le personnage peut changer : la vidéo devra alors passer d'un visage à l'autre.",
   "L'expression et le regard sont bien suivis ; un mouvement de tête ou de corps l'est mal (« lower his head » ignoré en P8).",
-  "Reste proche de l'image de départ : c'est la fin du plan, le modèle vidéo devra y arriver en 2 à 3 s.",
+  "Texte seul : décris toute l'image, sujet, cadrage, fond et style (« a watercolor painting of… »).",
+  "Plusieurs images : la 1re est la scène principale, les suivantes des personnes ou des objets à y mettre. " +
+    "Dis le rôle de chacune (« Put the cat from the second image on her lap »). Une 2ᵉ image donnée comme modèle " +
+    "d'expression est recopiée presque telle quelle (P8) : pour une expression, écris-la plutôt.",
+  "Pour une keyframe, reste proche de l'image de départ : le modèle vidéo devra y arriver en 2 à 3 s.",
   "Résultat moyen ? « Autre tirage » relance avec une autre graine, puis garde la meilleure (« Utiliser celle-ci »).",
 ];
 
 const KEYGEN_EXAMPLES = [
   "Make the man close his eyes, smile widely and warmly.",
   "Make her look to the left with a surprised expression, mouth slightly open.",
-  "Make him laugh, eyes squinting, mouth open.",
+  "Turn this photo into a watercolor painting, loose wet brushstrokes, white paper.",
+  "A watercolor portrait of an old fisherman with a grey beard, facing the viewer, plain white background.",
 ];
 
-// --- keygens: a keyframe created from the start image (Flux 2 Klein) -----------------------------
+// --- keygens: an image created by Flux 2 Klein ----------------------------------------------------
 //
-// The model edits the start image with a text instruction, so the result keeps the start's face,
-// framing and background (docs/benchmark.md, P8). When it finishes, the backend makes it the
-// keyframe at its position (technical match applied); older ones stay listed and can be used again.
+// From a prompt and/or up to three source images (the job's images or files from the computer),
+// to any image of the job, the start image included. Only an edit of the start image keeps its
+// face (docs/benchmark.md, P8). When it finishes, the backend puts it at its position (technical
+// match applied to a keyframe); older ones stay listed and can be used again.
 
-const keygenDrafts = new Map(); // job id -> instruction being typed, survives the form's rebuilds
+const KEYGEN_SOURCES_MAX = 3;
+const ASPECTS = [["portrait", "portrait (3:4)"], ["square", "carré"], ["landscape", "paysage (4:3)"]];
+// job id -> { instruction, sources: [{ keyframe } | { file, url }], target, aspect }: survives rebuilds
+const keygenDrafts = new Map();
+
+function keygenDraft(job) {
+  let d = keygenDrafts.get(job.id);
+  if (!d) {
+    d = { instruction: "", sources: job.keyframes.length ? [{ keyframe: 0 }] : [], target: null, aspect: "portrait" };
+    keygenDrafts.set(job.id, d);
+  }
+  d.sources = d.sources.filter((s) => s.file || job.keyframes.some((k) => k.position === s.keyframe));
+  return d;
+}
+
+function posName(p) { return p === 0 ? "image de départ" : `image ${p}`; }
 
 function keygenTargets(job) {
   const n = job.keyframes.length;
+  if (n === 0) return [[0, "comme image de départ"]];
   const opts = [];
   for (let i = n - 1; i >= 1; i--) opts.push([i, i === n - 1 ? `à la place de l'image ${i} (fin)` : `à la place de l'image ${i}`]);
   opts.push([n, n === 1 ? "comme image de fin" : `comme nouvelle image ${n}`]);
+  opts.push([0, "à la place de l'image de départ"]);
   return opts;
 }
 
+const hasTakes = (job) => job.segments.some((s) => s.takes.length);
+
+// Replacing the start image while takes exist: they keep the old one, say so before going on.
+function confirmStartReplace(job) {
+  return !hasTakes(job) || confirm("Des prises partent de l'image de départ actuelle. Elles restent telles quelles, " +
+    "mais les nouvelles prises partiront de l'image créée, et les autres images seront réajustées dessus. Continuer ?");
+}
+
 function renderKeygenForm(job) {
-  if (!job.keyframes.length) return [];
+  const d = keygenDraft(job);
+  const n = job.keyframes.length;
+  const targets = keygenTargets(job);
+  if (!targets.some(([p]) => p === d.target)) d.target = targets[0][0];
+
   const instruction = h("textarea", { class: "prompt", rows: 2, dataset: { next: "keygen" },
-    placeholder: "ex. « Make her close her eyes and smile widely » ; ce qui ne change pas est gardé",
-    oninput: (ev) => keygenDrafts.set(job.id, ev.target.value) });
-  instruction.value = keygenDrafts.get(job.id) || "";
-  const target = h("select", {}, keygenTargets(job).map(([pos, label]) => h("option", { value: pos }, label)));
-  const go = async () => {
-    if (!instruction.value.trim()) { toast("Écris d'abord ce qui doit changer."); return; }
-    const g = await act(() => api("POST", `/jobs/${job.id}/keygens`,
-      { position: Number(target.value), instruction: instruction.value }));
-    if (g) toast(`Création de l'image ${g.position} lancée (~40 s).`, false);
+    oninput: (ev) => { d.instruction = ev.target.value; } });
+  instruction.value = d.instruction;
+  const target = h("select", { onchange: (ev) => { d.target = Number(ev.target.value); update(); } },
+    targets.map(([pos, label]) => h("option", { value: pos, selected: pos === d.target }, label)));
+  const aspect = h("label", { class: "inline" }, "Format",
+    h("select", { onchange: (ev) => { d.aspect = ev.target.value; } },
+      ASPECTS.map(([v, label]) => h("option", { value: v, selected: v === d.aspect }, label))));
+  const sourcesBox = h("div", { class: "keygen-sources" });
+  const notes = h("div", { class: "keygen-notes" });
+
+  const addFile = (file) => {
+    if (d.sources.length >= KEYGEN_SOURCES_MAX) { toast(`${KEYGEN_SOURCES_MAX} images source au plus.`); return; }
+    d.sources.push({ file, url: URL.createObjectURL(file) });
+    update();
   };
+  const remove = (i) => {
+    const [s] = d.sources.splice(i, 1);
+    if (s.url) URL.revokeObjectURL(s.url);
+    update();
+  };
+  const move = (i) => { // to the front: becomes the main scene
+    d.sources.unshift(...d.sources.splice(i, 1));
+    update();
+  };
+
+  function renderSources() {
+    const chips = d.sources.map((s, i) => {
+      const k = s.file ? null : job.keyframes.find((x) => x.position === s.keyframe);
+      return h("figure", { class: "source" + (i === 0 ? " main" : "") },
+        h("img", { src: s.file ? s.url : kfUrl(k), alt: "" }),
+        h("figcaption", {}, s.file ? s.file.name : posName(s.keyframe),
+          h("span", { class: "muted" }, i === 0 ? " · scène principale" : " · personne / objet")),
+        h("div", { class: "row small-buttons" },
+          i > 0 ? h("button", { type: "button", title: "En faire la scène principale", onclick: () => move(i) }, "1re") : null,
+          h("button", { type: "button", title: "Retirer cette image source", onclick: () => remove(i) }, "×")));
+    });
+    const free = job.keyframes.filter((k) => !d.sources.some((s) => s.keyframe === k.position));
+    const add = d.sources.length < KEYGEN_SOURCES_MAX ? dropZone(h("div", { class: "source add" },
+      free.length ? h("select", { onchange: (ev) => {
+        if (ev.target.value !== "") { d.sources.push({ keyframe: Number(ev.target.value) }); update(); }
+      } }, h("option", { value: "" }, "+ une image du projet"),
+      free.map((k) => h("option", { value: k.position }, posName(k.position)))) : null,
+      filePicker(addFile, "+ une image de l'ordinateur"),
+      h("span", { class: "muted small" }, "ou dépose-la ici")), addFile) : null;
+    return [
+      chips.length ? chips : h("p", { class: "muted small source-none" },
+        "Aucune image source : l'image vient du texte seul."),
+      add,
+    ];
+  }
+
+  function update() {
+    sourcesBox.replaceChildren(...renderSources().flat().filter(Boolean));
+    const fromStart = d.sources[0] && !d.sources[0].file && d.sources[0].keyframe === 0;
+    instruction.placeholder = d.sources.length
+      ? "ce qui change, ex. « Make her close her eyes and smile widely » (facultatif) ; le reste est gardé"
+      : "décris toute l'image, ex. « A watercolor portrait of an old fisherman, plain white background »";
+    aspect.hidden = n > 0 || d.sources.length > 0;
+    const lines = [];
+    if (d.target !== 0 && !fromStart) {
+      lines.push("Sans l'image de départ comme 1re image source, le visage et le style peuvent changer : la vidéo " +
+        "devra passer de l'un à l'autre.");
+    }
+    if (d.target === 0 && n > 0) {
+      lines.push("L'image créée remplacera l'image de départ ; les autres images seront réajustées dessus." +
+        (hasTakes(job) ? " Les prises déjà faites restent, mais partent de l'ancienne." : ""));
+    }
+    notes.replaceChildren(...lines.map((t) => h("p", { class: "warn-note" }, t)));
+  }
+
+  const go = async () => {
+    if (!d.sources.length && !d.instruction.trim()) {
+      toast("Écris un prompt, ou ajoute une image source.");
+      return;
+    }
+    if (d.target === 0 && n > 0 && !confirmStartReplace(job)) return;
+    const f = new FormData();
+    f.append("position", d.target);
+    f.append("instruction", d.instruction);
+    const files = d.sources.filter((s) => s.file);
+    f.append("sources", JSON.stringify(d.sources.map((s) => (s.file ? { upload: files.indexOf(s) } : { keyframe: s.keyframe }))));
+    for (const s of files) f.append("files", s.file, s.file.name);
+    if (!aspect.hidden) f.append("aspect", d.aspect);
+    const g = await act(() => api("POST", `/jobs/${job.id}/keygens`, f));
+    if (g) toast(`Création de l'${posName(g.position)} lancée (~40 s).`, false);
+  };
+
+  update();
   const est = estimate(preset("keyframe-klein") || {});
   return [
-    h("h3", {}, "Créer une image depuis le départ"),
+    h("h3", {}, n === 0 ? "Ou crée l'image de départ" : "Créer une image"),
     h("p", { class: "muted small" },
-      "Pour une image de fin qui garde le visage, le cadrage et le fond de l'image de départ : écris ce qui change ",
-      "(expression, regard, geste) et un modèle d'image (Flux 2 Klein) modifie l'image de départ. ",
-      "Mieux qu'une image prise dans un aperçu, qui dérive (visage, âge). Consigne en anglais de préférence."),
+      "Un modèle d'image (Flux 2 Klein) crée une image depuis un texte et/ou des images source. ",
+      n === 0 ? "Sans image, décris toute l'image dans le prompt. "
+        : "Pour une image de fin qui garde le visage, le cadrage et le fond du départ, garde l'image de départ comme " +
+          "1re source et écris ce qui change (expression, regard, geste) : mieux qu'une image prise dans un aperçu, " +
+          "qui dérive (visage, âge). ",
+      "Prompt en anglais de préférence."),
+    h("div", { class: "keygen-field" }, h("span", { class: "field-label" }, "Images source (3 au plus)"), sourcesBox),
     h("div", { class: "keygen-row" }, instruction,
-      h("div", { class: "keygen-actions" }, target,
+      h("div", { class: "keygen-actions" }, target, aspect,
         h("button", { type: "button", class: "primary", onclick: go },
           `Créer l'image${est ? ` (~${fmtDuration(est)})` : ""}`))),
+    notes,
     promptTips(`keygen-${job.id}`, instruction, KEYGEN_TIPS, KEYGEN_EXAMPLES),
   ];
 }
 
-function keygenStartUrl(g) { // the start image as it was when the keygen was created
-  return g.output_url ? g.output_url.replace(/(\d+)\.png$/, "$1_start.png") : null;
-}
+function sourceName(s) { return s.kind === "upload" ? "image déposée" : posName(s.position); }
 
 function isCurrentKeygen(job, g) {
   return job.keyframes.some((k) => k.position === g.position && k.source_keygen_id === g.id);
 }
 
+function useKeygen(job, g) {
+  if (g.position === 0 && job.keyframes.length && !confirmStartReplace(job)) return;
+  act(() => api("POST", `/keygens/${g.id}/use`));
+}
+
+function keygenFigures(g, onclick) {
+  const fig = (src, caption) => h("figure", {}, h("img", { src, title: onclick ? "Agrandir" : null, onclick }),
+    h("figcaption", {}, caption));
+  const srcs = g.sources.length
+    ? g.sources.map((s, i) => fig(s.url, `source${g.sources.length > 1 ? ` ${i + 1}` : ""} : ${sourceName(s)}`))
+    : [h("div", { class: "text-only muted small" }, "texte seul")];
+  return [...srcs, h("span", { class: "arrow" }, "→"), fig(g.output_url, "image créée")];
+}
+
 function renderKeygen(job, g) {
   const q = queueItem("keygen", g.id);
   const current = isCurrentKeygen(job, g);
-  const again = () => act(() => api("POST", `/jobs/${job.id}/keygens`, { position: g.position, instruction: g.instruction }));
+  const again = () => act(() => api("POST", `/keygens/${g.id}/again`));
   const head = h("div", { class: "take-head" },
-    h("strong", {}, `Création #${g.id}`), " ", h("span", { class: "tier keyframe" }, `image ${g.position}`), " ", badge(g.status),
-    current ? h("span", { class: "badge retained" }, `c'est l'image ${g.position}`) : null,
+    h("strong", {}, `Création #${g.id}`), " ", h("span", { class: "tier keyframe" }, posName(g.position)), " ", badge(g.status),
+    current ? h("span", { class: "badge retained" }, `c'est l'${posName(g.position)}`) : null,
     h("span", { class: "muted small", title: g.preset }, ` graine ${g.seed} · ${g.settings.resolution || ""}`),
     h("span", { class: "spacer" }),
     isLive(g)
       ? h("button", { type: "button", class: "danger", onclick: () => act(() => api("POST", `/keygens/${g.id}/cancel`)) },
         g.cancel_requested ? "annulation…" : "Annuler")
       : [g.status === "done" && !current
-        ? h("button", { type: "button", title: `Remet cette image comme image ${g.position}`,
-          onclick: () => act(() => api("POST", `/keygens/${g.id}/use`)) }, "Utiliser celle-ci") : null,
-      h("button", { type: "button", title: "Même consigne, autre tirage (graine)", onclick: again }, "Autre tirage")]);
-  const body = [h("p", { class: "keygen-instruction" }, `« ${g.instruction} »`)];
+        ? h("button", { type: "button", title: `Remet cette image comme ${posName(g.position)}`,
+          onclick: () => useKeygen(job, g) }, "Utiliser celle-ci") : null,
+      h("button", { type: "button", title: "Mêmes images source et même prompt, autre tirage (graine)", onclick: again },
+        "Autre tirage")]);
+  const body = [g.instruction
+    ? h("p", { class: "keygen-instruction" }, `« ${g.instruction} »`)
+    : h("p", { class: "keygen-instruction muted" }, "sans prompt")];
   if (g.status === "queued") {
     body.push(h("p", { class: "muted" }, q ? `En file : commence dans ${fmtDuration(q.starts_in_s)} environ, ` +
       `dure ${fmtDuration(q.remaining_s)}.` : "En file."));
   } else if (g.status === "running") {
     body.push(renderProgress(g, q));
   } else if (g.status === "done" && g.output_url) {
-    const fig = (src, caption) => h("figure", {}, h("img", { src, title: "Agrandir",
-      onclick: () => openKeygenCompare(g) }), h("figcaption", {}, caption));
-    body.push(h("div", { class: "keygen-pair" },
-      fig(keygenStartUrl(g), "image de départ"), fig(g.output_url, "image créée")));
+    body.push(h("div", { class: "keygen-pair" }, keygenFigures(g, () => openKeygenCompare(g))));
     if (g.durations) body.push(h("p", { class: "muted small" }, `Créée en ${fmtDuration(g.durations.total)}, le ${fmtDate(g.finished_at)}.`));
     if (g.error) body.push(h("p", { class: "muted small" }, g.error));
   } else if (g.status === "failed") {
@@ -909,21 +1041,20 @@ function renderKeygen(job, g) {
 }
 
 function openKeygenCompare(g) {
-  const fig = (src, caption) => h("figure", {}, h("img", { src }), h("figcaption", {}, caption));
   openModal(h("div", {},
-    h("h3", {}, `Création #${g.id} : image ${g.position}`),
-    h("p", {}, `« ${g.instruction} »`),
-    h("div", { class: "compare" }, fig(keygenStartUrl(g), "Image de départ"), fig(g.output_url, "Image créée"))));
+    h("h3", {}, `Création #${g.id} : ${posName(g.position)}`),
+    g.instruction ? h("p", {}, `« ${g.instruction} »`) : null,
+    h("div", { class: "compare" }, keygenFigures(g, null))));
 }
 
 function updateKeygens(view, job) {
-  view.querySelector(".keygen").hidden = !job.keyframes.length;
-  syncOne(view.querySelector(".keygen-form"), JSON.stringify([job.id, job.keyframes.length, state.presets.length]),
-    renderKeygenForm);
+  syncOne(view.querySelector(".keygen-form"), JSON.stringify([job.id, job.keyframes.map((k) => [k.position, k.version]),
+    hasTakes(job), state.presets.length]), renderKeygenForm);
   syncList(view.querySelector(".keygen-list"), [...job.keygens].reverse(), (g) => g.id, (g) => {
     const q = queueItem("keygen", g.id);
     return JSON.stringify([g.status, g.phase, g.step, g.progress, g.preview_url, g.output_url, g.error,
-      g.cancel_requested, isCurrentKeygen(job, g), isLive(g) ? [q?.starts_in_s, Math.round(q?.remaining_s / 5)] : 0]);
+      g.cancel_requested, isCurrentKeygen(job, g), hasTakes(job),
+      isLive(g) ? [q?.starts_in_s, Math.round(q?.remaining_s / 5)] : 0]);
   }, (g) => renderKeygen(job, g));
 }
 

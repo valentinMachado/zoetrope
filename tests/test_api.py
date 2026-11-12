@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -137,17 +139,41 @@ def test_front_is_served(client):
 def test_keygen_routes(client):
     job = _job_with_keyframes(client, n=2)
     url = f"/api/jobs/{job['id']}/keygens"
-    assert client.post(url, json={"position": 0, "instruction": "smile"}).status_code == 400
-    assert client.post(url, json={"position": 3, "instruction": "smile"}).status_code == 400
-    assert client.post(url, json={"position": 1, "instruction": "  "}).status_code == 400
-    g = client.post(url, json={"position": 1, "instruction": "Make him smile", "seed": 5}).json()
+    start = json.dumps([{"keyframe": 0}])
+    assert client.post(url, data={"position": 3, "instruction": "smile", "sources": start}).status_code == 400
+    assert client.post(url, data={"position": 1, "instruction": "  "}).status_code == 400  # no prompt, no source
+    assert client.post(url, data={"position": 1, "sources": json.dumps([{"keyframe": 5}])}).status_code == 400
+    assert client.post(url, data={"position": 1, "sources": "[{\"upload\": 0}]"}).status_code == 400  # no file
+    assert client.post(url, data={"position": 1, "sources": json.dumps([{"keyframe": 0}] * 4)}).status_code == 400
+    g = client.post(url, data={"position": 1, "instruction": "Make him smile", "seed": 5, "sources": start}).json()
     assert g["status"] == "queued" and g["seed"] == 5
-    assert g["settings"]["image_refs"][0].replace("\\", "/").endswith(f"gen/{g['id']}_start.png")
+    assert g["settings"]["image_refs"][0].replace("\\", "/").endswith(f"gen/{g['id']}_src0.png")
+    assert g["sources"][0]["kind"] == "keyframe" and g["sources"][0]["url"].endswith(f"{g['id']}_src0.png")
     q = client.get("/api/queue").json()["items"]
     assert q[0]["kind"] == "keygen" and q[0]["position"] == 1
     assert client.get(f"/api/jobs/{job['id']}").json()["status"] == "queued"
     assert client.post(f"/api/keygens/{g['id']}/use").status_code == 400  # not finished
     assert client.post(f"/api/keygens/{g['id']}/cancel").json()["status"] == "cancelled"
+    again = client.post(f"/api/keygens/{g['id']}/again").json()
+    assert again["id"] != g["id"] and again["sources"][0]["kind"] == "keyframe"
+    assert again["instruction"] == "Make him smile" and again["settings"]["resolution"] == g["settings"]["resolution"]
+
+    # the start image itself, from an uploaded image (with transparency) plus the start as a second reference
+    files = [("files", ("ref.png", png_bytes(portrait()), "image/png"))]
+    g = client.post(url, data={"position": 0, "sources": json.dumps([{"upload": 0}, {"keyframe": 0}])},
+                    files=files).json()
+    assert [s["kind"] for s in g["sources"]] == ["upload", "keyframe"] and len(g["settings"]["image_refs"]) == 2
+    assert Image.open(paths.keygens_dir(job["id"]) / f"{g['id']}_src0.png").mode == "RGB"
+
+
+def test_text_only_keygen_on_an_empty_job_takes_the_chosen_format(client):
+    job = client.post("/api/jobs", json={}).json()
+    url = f"/api/jobs/{job['id']}/keygens"
+    assert client.post(url, data={"position": 1, "instruction": "A fox"}).status_code == 400  # only 0 exists
+    assert client.post(url, data={"position": 0, "instruction": "A fox", "aspect": "wide"}).status_code == 400
+    g = client.post(url, data={"position": 0, "instruction": "A fox", "aspect": "landscape"}).json()
+    w, h = (int(v) for v in g["settings"]["resolution"].split("x"))
+    assert w > h and g["sources"] == [] and g["settings"]["video_prompt_type"] == ""
 
 
 def test_old_base_gets_the_new_keyframe_column(outputs):

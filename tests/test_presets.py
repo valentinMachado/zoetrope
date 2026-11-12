@@ -57,11 +57,24 @@ def test_keygen_resolution_keeps_the_start_aspect_within_the_budget():
 def test_build_keygen_settings():
     p = presets.load(presets.KEYFRAME)
     assert p.tier == "keyframe" and p.model_type == "flux2_klein_4b"
-    s = presets.build_keygen_settings(p, instruction="Make her smile.", image=Path("s.png"),
+    s = presets.build_keygen_settings(p, instruction="Make her smile.", images=[Path("s.png")],
                                       image_size=(480, 510), seed=3)
     assert s["image_refs"] == ["s.png"] and s["video_prompt_type"] == "KI" and s["image_mode"] == 1
     assert s["prompt"].startswith("Make her smile. Keep the same person")
     assert s["seed"] == 3 and s["resolution"] == "480x512" and s["num_inference_steps"] == 4
     with pytest.raises(presets.PresetError):
-        presets.build_keygen_settings(presets.load("preview"), instruction="x", image=Path("s"),
+        presets.build_keygen_settings(presets.load("preview"), instruction="x", images=[Path("s")],
                                       image_size=(1, 1), seed=1)
+
+
+def test_keygen_settings_from_text_alone_or_several_images():
+    p = presets.load(presets.KEYFRAME)
+    s = presets.build_keygen_settings(p, instruction="A watercolor fox.", images=[], image_size=(4, 3), seed=1)
+    assert s["video_prompt_type"] == "" and "image_refs" not in s and s["prompt"] == "A watercolor fox."
+    w, h = (int(v) for v in s["resolution"].split("x"))
+    assert w > h
+    s = presets.build_keygen_settings(p, instruction="", images=[Path("a.png"), Path("b.png")],
+                                      image_size=(480, 512), seed=1)
+    assert s["image_refs"] == ["a.png", "b.png"] and s["prompt"] == p.prompt_suffix
+    with pytest.raises(presets.PresetError):
+        presets.build_keygen_settings(p, instruction=" ", images=[], image_size=(1, 1), seed=1)

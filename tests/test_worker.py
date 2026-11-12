@@ -192,8 +192,8 @@ def test_assembly_fails_cleanly_on_missing_file(conn):
 
 def test_keygen_replaces_the_keyframe_and_an_older_one_can_be_used_again(conn):
     job, _ = _job(conn, n_kf=2)
-    g1 = service.create_keygen(conn, job["id"], 1, "Make him smile.", seed=1)
-    g2 = service.create_keygen(conn, job["id"], 2, "Close the eyes.", seed=2)  # appends keyframe 2
+    g1 = service.create_keygen(conn, job["id"], 1, "Make him smile.", sources=[0], seed=1)
+    g2 = service.create_keygen(conn, job["id"], 2, "Close the eyes.", sources=[0], seed=2)  # appends keyframe 2
     w = Worker(conn, session_factory=FakeSession)
     assert w.run_next() and w.run_next()
     assert w.loaded == ("flux2_klein_4b", 4.0)
@@ -208,7 +208,7 @@ def test_keygen_replaces_the_keyframe_and_an_older_one_can_be_used_again(conn):
     assert Image.open(paths.keyframes_dir(job["id"]) / "1.png").size == start.size
     assert not list(paths.wan2gp_output_dir().glob("*.jpg"))
 
-    g3 = service.create_keygen(conn, job["id"], 1, "Make him smile.", seed=3)
+    g3 = service.create_keygen(conn, job["id"], 1, "Make him smile.", sources=[0], seed=3)
     assert w.run_next()
     assert service.job_detail(conn, job["id"])["keyframes"][1]["source_keygen_id"] == g3["id"]
     k = service.use_keygen(conn, g1["id"])
@@ -220,9 +220,47 @@ def test_keygen_replaces_the_keyframe_and_an_older_one_can_be_used_again(conn):
 
 def test_keygen_whose_position_is_gone_stays_done_with_the_reason(conn):
     job, _ = _job(conn, n_kf=2)
-    g = service.create_keygen(conn, job["id"], 2, "Wave.", seed=1)  # would append keyframe 2
+    g = service.create_keygen(conn, job["id"], 2, "Wave.", sources=[0], seed=1)  # would append keyframe 2
     last = service.job_detail(conn, job["id"])["keyframes"][1]
     service.delete_keyframe(conn, last["id"])  # position 2 is no longer next to an existing keyframe
     Worker(conn, session_factory=FakeSession).run_next()
     row = db.row(conn.execute("SELECT * FROM keygen WHERE id = ?", (g["id"],)).fetchone())
     assert row["status"] == "done" and "Not installed" in row["error"]
+
+
+def test_keygen_can_replace_the_start_image(conn):
+    job, seg = _job(conn, n_kf=2)
+    old_start = Image.open(paths.keyframes_dir(job["id"]) / "0.png").copy()
+    t = service.create_take(conn, seg["id"], "preview")
+    service.cancel(conn, "take", t["id"])
+    service.match_keyframe(conn, service.job_detail(conn, job["id"])["keyframes"][1]["id"])
+    g = service.create_keygen(conn, job["id"], 0, "Make it a watercolor.", sources=[0, 1], seed=1)
+    Worker(conn, session_factory=FakeSession).run_next()
+    kfs = {k["position"]: k for k in service.job_detail(conn, job["id"])["keyframes"]}
+    assert kfs[0]["source_keygen_id"] == g["id"]
+    new_start = Image.open(paths.keyframes_dir(job["id"]) / "0.png")
+    assert new_start.tobytes() != old_start.tobytes()
+    # the adjusted keyframe is prepared again on the new start: same size
+    assert Image.open(paths.keyframes_dir(job["id"]) / "1.png").size == new_start.size
+    # a take keeps its own copy of the old start
+    take_start = Image.open(paths.takes_dir(job["id"]) / f"{t['id']}_start.png")
+    assert take_start.tobytes() == old_start.tobytes()
+
+
+def test_text_only_keygen_creates_the_start_of_an_empty_job(conn):
+    job = service.create_job(conn)
+    g = service.create_keygen(conn, job["id"], 0, "A watercolor fox.", aspect="square", seed=1)
+    assert g["settings"]["video_prompt_type"] == "" and "image_refs" not in g["settings"]
+    Worker(conn, session_factory=FakeSession).run_next()
+    detail = service.job_detail(conn, job["id"])
+    assert [k["position"] for k in detail["keyframes"]] == [0]
+    assert detail["keyframes"][0]["source_keygen_id"] == g["id"] and len(detail["segments"]) == 1
+
+
+def test_a_keygen_from_before_p11_lists_the_start_as_its_source(conn):
+    job, _ = _job(conn, n_kf=1)
+    g = service.create_keygen(conn, job["id"], 1, "Smile.", sources=[0], seed=1)
+    conn.execute("UPDATE keygen SET sources = NULL WHERE id = ?", (g["id"],))
+    g = service.job_detail(conn, job["id"])["keygens"][0]
+    url = f"/files/{job['id']}/keyframes/gen/{g['id']}_start.png"
+    assert g["sources"] == [{"kind": "keyframe", "position": 0, "url": url}]

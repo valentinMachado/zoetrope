@@ -333,6 +333,24 @@ construction. Cost: ~40 s per keyframe at 512 plus a model switch in the worker.
 pose follows the text loosely (no head lowering), and anything wrong in the start image (fringes)
 is kept. One subject, one seed: not measured on a drawing or a watercolour.
 
+### Text alone and two source images (P11)
+
+The keygen became an image generator in P11 (prompt and/or up to three source images, any target,
+the start image included). Checked once on job 6, through Zoetrope, seeds 11 and 12:
+
+- **Text alone, as the start image** (keygen #2, no source, portrait format, 432x576): "a
+  watercolor portrait of a young woman with short red hair…" gives a clean watercolour portrait
+  on white paper. 2 min 57 s, Klein loaded right after the 14B (cold Klein load and text
+  encoding included).
+- **Two sources, as the end keyframe** (keygen #3: the generated start, then an uploaded
+  colourful watercolour; "make her close her eyes and smile widely, with colorful paint splashes
+  like in the second image"): the start's face, hair and framing are kept, the eyes close, and the
+  second image's palette and splashes are painted on her face and neck. 43 s, Klein loaded.
+- **A FastWan preview from the generated start** (take #8, 2.5 s, seed 21): the motion follows the
+  prompt (wider smile, eyes closing), but the watercolour drifts to a smoother, more saturated
+  illustration from frame 20 (the P9 style problem, not specific to a generated start). 9 min
+  including the switch from Klein to the 5B.
+
 ## Recommendation
 
 **5B for previews.** It fits comfortably (5.7 GB VRAM, 24 GB RAM). FastWan (3 steps): 4 min
@@ -350,7 +368,8 @@ The backend uses it for every final render, queued (preset `final-14b`).
 **Flux 2 Klein 4B for keyframes**: an end keyframe made by editing the start image with a text
 instruction (~40 s at 512) keeps the start's identity through the 14B FLF, where a FastWan frame
 pulls it away (section above). Wired into the backend and front as "create an image from the
-start" (preset `keyframe-klein`).
+start" (preset `keyframe-klein`), widened in P11 to an image generator (text and/or up to three
+source images, the start image as a possible target).
 
 **ComfyUI: not yet.** Wan2GP already provides everything the brief expects from ComfyUI:
 headless runs (`wgp.py --process settings.json`), a Python API (`WanGPSession`) and an MCP

@@ -3,9 +3,9 @@ loaded model survives between takes (the 14B takes minutes to load).
 
 It talks to the API only through the SQLite base: picks the next task (zoetrope.queue order),
 writes progress at each Wan2GP event (phase, step, last preview image, log tail, phase
-durations), honours cancel_requested, and keeps a heartbeat. Keyframe generations (keygens,
-Flux 2 Klein) run like takes, in the same session: loading Klein unloads the video model. A
-finished keygen's image becomes the keyframe at its position (service.use_keygen). Assemblies run
+durations), honours cancel_requested, and keeps a heartbeat. Image creations (keygens, Flux 2
+Klein: a keyframe or the start image) run like takes, in the same session: loading Klein unloads
+the video model. A finished keygen's image becomes the image at its position (service.use_keygen). Assemblies run
 in the same queue (CPU, plus RIFE on the GPU for fps x2).
 
 Start it detached with scripts/start-worker.ps1, stop it with scripts/stop-worker.ps1 (a stop file,
@@ -179,7 +179,7 @@ class Worker:
         self._run_model_task("take", take, paths.takes_dir(job_id), store)
 
     def run_keygen(self, gen: dict[str, Any]) -> None:
-        """Generate a keyframe; when done, it replaces the keyframe at its position. If that
+        """Create an image; when done, it replaces the image at its position. If that
         fails (the position no longer exists), the keygen stays done with the reason in `error`
         and the user can use it later."""
 

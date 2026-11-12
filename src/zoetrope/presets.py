@@ -6,10 +6,12 @@ the memory profile, and measured phase durations used for the time-remaining est
 takes of the preset exist. A take snapshots the settings resolved here: editing a preset later
 does not change past takes.
 
-A `keyframe` preset (tier "keyframe", Flux 2 Klein) generates a keyframe by editing the start image
-with a text instruction (docs/benchmark.md, "Identity match of a keyframe"). Its `resolution` is a
-pixel budget: the output takes the start image's aspect ratio within it. Its `prompt_suffix`
-follows the user's instruction and asks the model to keep what must not change.
+A `keyframe` preset (tier "keyframe", Flux 2 Klein) creates a keyframe or the start image from a
+text instruction and/or up to KEYGEN_SOURCES_MAX source images; editing the start image keeps its
+identity (docs/benchmark.md, "Identity match of a keyframe"). Its `resolution` is a pixel budget:
+the output takes the main source's aspect ratio (or a chosen format) within it. Its
+`prompt_suffix` follows the user's instruction when there is a source image and asks the model to
+keep what must not change.
 """
 
 from __future__ import annotations
@@ -26,6 +28,9 @@ PREVIEW = "preview"
 DEFAULT_FINAL = "final-14b"
 KEYFRAME = "keyframe-klein"
 TIERS = ("preview", "final", "keyframe")
+KEYGEN_SOURCES_MAX = 3  # main scene + up to two people or objects
+# Aspect ratios for an image created from text alone, when the job has no start image yet.
+KEYGEN_ASPECTS = {"portrait": (3, 4), "square": (1, 1), "landscape": (4, 3)}
 
 
 class PresetError(ValueError):
@@ -141,23 +146,35 @@ def build_keygen_settings(
     preset: Preset,
     *,
     instruction: str,
-    image: Path,
+    images: list[Path],
     image_size: tuple[int, int],
     seed: int,
 ) -> dict[str, Any]:
-    """Settings sent to Wan2GP to edit the start image `image` with a text instruction."""
+    """Settings sent to Wan2GP to create an image with Flux 2 Klein.
+
+    `images` are the source images in order: the first is the main scene the model edits (Klein's
+    `KI` reference mode), the next ones people or objects to bring in. With none, the image comes
+    from the text alone. `image_size` gives the aspect ratio (the main source's, or the format
+    chosen for a text-only image). The preset's `prompt_suffix`, which asks to keep the main
+    source unchanged, only follows an edit; with sources, the instruction may be empty."""
     if preset.tier != "keyframe":
         raise PresetError(f"Preset {preset.name} is not a keyframe preset")
     prompt = instruction.strip()
-    if preset.prompt_suffix:
+    if not images and not prompt:
+        raise PresetError("A text-only image needs a prompt")
+    if images and preset.prompt_suffix:
         sep = " " if prompt.endswith((".", "!", "?")) else ". "
         prompt = f"{prompt}{sep}{preset.prompt_suffix}" if prompt else preset.prompt_suffix
     settings: dict[str, Any] = dict(preset.settings)
     settings.update(
         prompt=prompt,
-        image_refs=[str(image)],
         resolution=fit_resolution(preset.settings.get("resolution", "480x512"), image_size),
         seed=int(seed),
         overrides=profile_override(preset.memory_profile),
     )
+    if images:
+        settings.update(image_refs=[str(i) for i in images], video_prompt_type="KI")
+    else:
+        settings.pop("image_refs", None)
+        settings["video_prompt_type"] = ""
     return settings

@@ -1,11 +1,12 @@
 """Operations on jobs, keyframes, segments, takes and assemblies. The API is a thin layer over
 these; the worker only runs takes and assemblies created here.
 
-A keyframe is an upload (the front extracts frames from a take if the user wants one) or the
-result of a keygen: Flux 2 Klein edits the start image with a text instruction, so the keyframe
-keeps the start's identity, framing and background (docs/benchmark.md, "Identity match of a
-keyframe"). A finished keygen replaces the keyframe at its position, technical match applied;
-older keygens stay listed and `use_keygen` puts one back.
+A keyframe, the start image included, is an upload (the front extracts frames from a take if the
+user wants one) or the result of a keygen: Flux 2 Klein creates an image from a text instruction
+and/or up to three source images (keyframes of the job or uploaded images). Editing the start
+image keeps its identity, framing and background (docs/benchmark.md, "Identity match of a
+keyframe"); another source does not necessarily. A finished keygen replaces the image at its
+position, technical match applied; older keygens stay listed and `use_keygen` puts one back.
 Segment i goes from keyframe i to keyframe i+1 and is kept in sync with the keyframes: internal
 segments are `exact` (their end frame is sent to the model), the last one takes the job's end
 mode (`exact` or `guide`; in guide mode its end keyframe only serves to judge the preview).
@@ -277,29 +278,61 @@ def public_keyframe(k: dict[str, Any]) -> dict[str, Any]:
     return k
 
 
-# --- keygens: keyframes generated from the start image ------------------------------------------
+# --- keygens: images created by Flux 2 Klein ----------------------------------------------------
 
 
-def create_keygen(conn: sqlite3.Connection, job_id: int, position: int, instruction: str, *,
-                  seed: int | None = None, preset: str = presets.KEYFRAME) -> dict[str, Any]:
-    """Queue the generation of the keyframe at `position` (an existing one, replaced when the
-    keygen finishes, or the next one) by editing the start image with `instruction`. The start
-    image is snapshotted: changing it later does not change this keygen."""
+def create_keygen(conn: sqlite3.Connection, job_id: int, position: int, instruction: str = "", *,
+                  sources: list[int | bytes] = (), aspect: str | None = None, seed: int | None = None,
+                  preset: str = presets.KEYFRAME) -> dict[str, Any]:
+    """Queue the creation of the image at `position`: the start image (0), an existing keyframe
+    (replaced when the keygen finishes) or the next one. `sources` are up to KEYGEN_SOURCES_MAX
+    images, the first being the main scene the model edits: keyframe positions or uploaded images.
+    With no source the image comes from the instruction alone, in the start image's format, or in
+    `aspect` (portrait, square, landscape) when the job has no start image yet. Sources are
+    snapshotted: changing a keyframe later does not change this keygen."""
     _get(conn, "job", job_id)
     count = conn.execute("SELECT COUNT(*) FROM keyframe WHERE job_id = ?", (job_id,)).fetchone()[0]
-    if count == 0:
-        raise Invalid("The job has no start image")
-    if position < 1 or position > count:
-        raise Invalid(f"A generated keyframe goes at a position between 1 and {count}")
-    if not instruction.strip():
-        raise Invalid("The instruction is empty")
+    if position < 0 or position > count:
+        raise Invalid(f"A created image goes at a position between 0 and {count}")
+    sources = list(sources)
+    if len(sources) > presets.KEYGEN_SOURCES_MAX:
+        raise Invalid(f"At most {presets.KEYGEN_SOURCES_MAX} source images")
+    start_params = _start_params(conn, job_id)
+    background = start_params.background if start_params else images.WHITE
+    resolved: list[tuple[dict[str, Any], Image.Image]] = []
+    for src in sources:
+        if isinstance(src, (bytes, bytearray)):
+            resolved.append(({"kind": "upload"}, images.flatten(_open_image(bytes(src)), background)))
+        else:
+            r = conn.execute("SELECT file FROM keyframe WHERE job_id = ? AND position = ?",
+                             (job_id, int(src))).fetchone()
+            if r is None:
+                raise Invalid(f"Keyframe {src} does not exist")
+            resolved.append(({"kind": "keyframe", "position": int(src)}, Image.open(r[0]).convert("RGB")))
+    if not resolved and not instruction.strip():
+        raise Invalid("Write a prompt, or give a source image")
+    start = _start_image(conn, job_id)
+    if resolved:
+        size = resolved[0][1].size
+    elif start is not None:
+        size = start.size
+    else:
+        aspect = aspect or "portrait"
+        if aspect not in presets.KEYGEN_ASPECTS:
+            raise Invalid(f"aspect must be one of {', '.join(presets.KEYGEN_ASPECTS)}")
+        size = presets.KEYGEN_ASPECTS[aspect]
+    return _queue_keygen(conn, job_id, position, instruction, resolved, size, seed, preset)
+
+
+def _queue_keygen(conn: sqlite3.Connection, job_id: int, position: int, instruction: str,
+                  sources: list[tuple[dict[str, Any], Image.Image]], size: tuple[int, int],
+                  seed: int | None, preset: str) -> dict[str, Any]:
     try:
         p = presets.load(preset)
     except presets.PresetError as e:
         raise Invalid(str(e)) from None
     if p.tier != "keyframe":
         raise Invalid(f"Preset {preset} is not a keyframe preset")
-    start = conn.execute("SELECT file FROM keyframe WHERE job_id = ? AND position = 0", (job_id,)).fetchone()[0]
     seed = presets.new_seed() if seed is None else int(seed)
     with db.transaction(conn):
         cur = conn.execute(
@@ -310,34 +343,62 @@ def create_keygen(conn: sqlite3.Connection, job_id: int, position: int, instruct
         gen_id = cur.lastrowid
         d = paths.keygens_dir(job_id)
         d.mkdir(parents=True, exist_ok=True)
-        start_copy = d / f"{gen_id}_start.png"
-        shutil.copyfile(start, start_copy)
-        with Image.open(start_copy) as im:
-            size = im.size
+        files, meta = [], []
+        for i, (m, img) in enumerate(sources):
+            f = d / f"{gen_id}_src{i}.png"
+            images.save_png(img, f)
+            files.append(f)
+            meta.append({**m, "file": str(f)})
         try:
-            settings = presets.build_keygen_settings(p, instruction=instruction, image=start_copy,
-                                                     image_size=size, seed=seed)
+            settings = presets.build_keygen_settings(p, instruction=instruction, images=files, image_size=size,
+                                                     seed=seed)
         except presets.PresetError as e:
             raise Invalid(str(e)) from None
         (d / f"{gen_id}.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
-        db.update(conn, "keygen", gen_id, settings=json.dumps(settings))
+        db.update(conn, "keygen", gen_id, settings=json.dumps(settings), sources=json.dumps(meta))
     return public_keygen(_get(conn, "keygen", gen_id))
 
 
+def again_keygen(conn: sqlite3.Connection, gen_id: int) -> dict[str, Any]:
+    """Another draw of a keygen: same target, prompt and source images (its snapshots), new seed."""
+    g = _get(conn, "keygen", gen_id)
+    sources = []
+    for m in _keygen_sources(g):
+        if not Path(m["file"]).is_file():
+            raise Invalid(f"A source image of keygen {gen_id} is missing")
+        sources.append(({k: v for k, v in m.items() if k != "file"}, Image.open(m["file"]).convert("RGB")))
+    w, h = (int(v) for v in db.loads(g["settings"], {}).get("resolution", "480x512").split("x"))
+    return _queue_keygen(conn, g["job_id"], g["position"], g["instruction"], sources, (w, h), None, g["preset"])
+
+
+def _keygen_sources(g: dict[str, Any]) -> list[dict[str, Any]]:
+    """The keygen's snapshotted sources. A keygen from before P11 had one: the start image."""
+    if g["sources"] is not None:
+        return db.loads(g["sources"], [])
+    return [{"kind": "keyframe", "position": 0,
+             "file": str(paths.keygens_dir(g["job_id"]) / f"{g['id']}_start.png")}]
+
+
 def use_keygen(conn: sqlite3.Connection, gen_id: int) -> dict[str, Any]:
-    """Make a finished keygen's image the keyframe at its position, with the technical match
-    (fit and colour match on the start image, the start's background). The worker calls it when
-    a keygen finishes; the user calls it to go back to an older one."""
+    """Make a finished keygen's image the keyframe at its position. The worker calls it when a
+    keygen finishes; the user calls it to go back to an older one. A keyframe gets the technical
+    match (fit and colour match on the start image, the start's background). A new start image
+    keeps the old start's background and the other keyframes are prepared again on it; takes
+    already rendered keep their copy of the old start."""
     g = _get(conn, "keygen", gen_id)
     if g["status"] != "done" or not g["output_file"] or not Path(g["output_file"]).is_file():
         raise Invalid(f"Keygen {gen_id} has no image")
     k = add_keyframe(conn, g["job_id"], g["position"], Path(g["output_file"]).read_bytes(), source_keygen_id=gen_id)
+    if g["position"] == 0:
+        return k
     background = "#" + "".join(f"{c:02x}" for c in _start_params(conn, g["job_id"]).background)
     return match_keyframe(conn, k["id"], enabled=True, background=background)
 
 
 def public_keygen(g: dict[str, Any]) -> dict[str, Any]:
     g = dict(g)
+    g["sources"] = [{**{k: v for k, v in m.items() if k != "file"}, "url": paths.to_url(m["file"])}
+                    for m in _keygen_sources(g)]
     g["settings"] = db.loads(g["settings"], {})
     g["durations"] = db.loads(g["durations"])
     g["output_url"] = paths.to_url(g.pop("output_file"))

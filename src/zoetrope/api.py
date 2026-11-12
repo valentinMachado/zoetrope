@@ -8,6 +8,7 @@ Run: `.venv/Scripts/python -m uvicorn zoetrope.api:app --port 8765` (see scripts
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 
@@ -75,12 +76,6 @@ class TakeIn(BaseModel):
     preset: str | None = None
 
 
-class KeygenIn(BaseModel):
-    position: int
-    instruction: str
-    seed: int | None = None
-
-
 class RetainIn(BaseModel):
     take_id: int | None
 
@@ -138,8 +133,23 @@ def delete_keyframe(keyframe_id: int, conn=Conn):
 
 
 @app.post("/api/jobs/{job_id}/keygens", status_code=201)
-def create_keygen(job_id: int, body: KeygenIn, conn=Conn):
-    return service.create_keygen(conn, job_id, body.position, body.instruction, seed=body.seed)
+async def create_keygen(job_id: int, position: int = Form(...), instruction: str = Form(""),
+                        sources: str = Form("[]"), aspect: str | None = Form(None), seed: int | None = Form(None),
+                        files: list[UploadFile] | None = File(None), conn=Conn):
+    """Multipart: `sources` is a JSON list, in order, of {"keyframe": position} or {"upload": i},
+    the i-th of `files`; empty for an image from the prompt alone."""
+    uploads = [await f.read() for f in files or []]
+    try:
+        spec = json.loads(sources)
+        resolved = [s["keyframe"] if "keyframe" in s else uploads[s["upload"]] for s in spec]
+    except (ValueError, TypeError, KeyError, IndexError):
+        raise HTTPException(400, "sources must be a JSON list of {keyframe: n} or {upload: i}") from None
+    return service.create_keygen(conn, job_id, position, instruction, sources=resolved, aspect=aspect, seed=seed)
+
+
+@app.post("/api/keygens/{gen_id}/again", status_code=201)
+def again_keygen(gen_id: int, conn=Conn):
+    return service.again_keygen(conn, gen_id)
 
 
 @app.post("/api/keygens/{gen_id}/use")
