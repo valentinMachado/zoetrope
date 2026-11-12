@@ -13,6 +13,9 @@ reasons behind it: [docs/brief-image-to-video.md](docs/brief-image-to-video.md) 
 No backend or frontend code yet. Measured capacity of this machine:
 [docs/benchmark.md](docs/benchmark.md).
 
+Work is delivered one phase per session with the `phased-delivery` skill; the plan is in
+`management/backlog/plan.md`.
+
 ## Layout
 
 | Folder       | Content                                                           | Tracked |
