@@ -10,7 +10,7 @@ reasons behind it: [docs/brief-image-to-video.md](docs/brief-image-to-video.md) 
 
 ## Status
 
-Backend in place (API, render worker, presets); no front yet. Measured capacity of this
+Backend (API, render worker, presets) and web front in place. Measured capacity of this
 machine: [docs/benchmark.md](docs/benchmark.md).
 
 Work is delivered one phase per session with the `phased-delivery` skill; the plan is in
@@ -36,11 +36,15 @@ Work is delivered one phase per session with the `phased-delivery` skill; the pl
 
 Two processes that talk only through `outputs/zoetrope.db` (SQLite, WAL):
 
-- **API** (`zoetrope.api`, FastAPI): own venv `.venv/` (`py -m uv sync`), serves `/api/*` and
-  the job files at `/files/*`. Restarting it never touches a render.
+- **API** (`zoetrope.api`, FastAPI): own venv `.venv/` (`py -m uv sync`), serves `/api/*`, the
+  job files at `/files/*` and the front at `/`. Restarting it never touches a render.
 - **Worker** (`zoetrope.worker`): runs in Wan2GP's venv with `src/` on `PYTHONPATH`, holds one
   `WanGPSession` so the loaded model survives between takes. Shared modules must stay
   Python 3.10-compatible and must not import FastAPI.
+
+The front (`src/zoetrope/front/`: one HTML page, plain JS, no build step) polls the API and
+only rebuilds the parts whose data changed, so a playing video or a prompt being typed survives
+a refresh. Frames are extracted in the browser (canvas) and uploaded as keyframes.
 
 Queue order, take/assembly lifecycle and keyframe preparation are documented in the module
 docstrings (`queue.py`, `service.py`, `worker.py`, `images.py`, `assembly.py`).
@@ -51,7 +55,7 @@ docstrings (`queue.py`, `service.py`, `worker.py`, `images.py`, `assembly.py`).
 py -m uv sync                                   # API venv + dev tools
 .venv\Scripts\python -m pytest                  # tests
 .venv\Scripts\python -m ruff check src tests    # lint
-scripts\start-api.ps1                           # API on http://127.0.0.1:8765
+scripts\start-api.ps1                           # API and front on http://127.0.0.1:8765
 scripts\start-worker.ps1                        # worker, detached; log in outputs\worker.log
 scripts\stop-worker.ps1 [-Force]                # stop after the current task, or kill
 ```

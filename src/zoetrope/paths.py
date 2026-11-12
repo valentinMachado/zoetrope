@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PRESETS_DIR = ROOT / "presets"
 LORAS_DIR = ROOT / "loras"
 WAN2GP_DIR = ROOT / "tools" / "Wan2GP"
+FRONT_DIR = Path(__file__).resolve().parent / "front"
 
 
 def outputs_dir() -> Path:

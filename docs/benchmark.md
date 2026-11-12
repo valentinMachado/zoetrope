@@ -235,6 +235,16 @@ RGBA cut-out as start image, prepared by the backend: alpha flattened on white, 
   turns light grey** (frame 0 to 1 difference 13.6, then ~5) and stays grey, with a thin blue line
   along the bottom edge late in the clip. The fringe jump is gone; this one is the 14B not
   holding pure white (255). Not addressed yet.
+- **Off-white background tried (P6)**: same job, seed and settings, the cut-out start image
+  flattened on #f5f5f5 (245) instead of white, the end keyframe matched on it: 22 min 18 s.
+  Mean level of the top corners, frames 0 / 1 / 5 / 10 / 40: white 255 / 249 / 236 / 234 / 238,
+  off-white 244 / 241 / 236 / 236 / 241. The frame 1 jump is halved (about 4 levels instead of 6)
+  but the background settles at the same ~235 grey. Worse, the histogram match of the FastWan
+  end keyframe (near-white noisy background, 253-255) onto a single-level 245 background
+  scatters it into blotches, and the 14B carries them into the second half of the clip.
+  **Not a fix**: white stays the default; the start image's background colour stays a setting.
+  The dark band at the bottom late in both clips is the shirt and tie the model adds, not the
+  background.
 - Assembly of that take at x2 (RIFE through the worker, colour match on): 11 s, 81 frames at
   32 fps.
 

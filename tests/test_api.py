@@ -104,3 +104,31 @@ def test_guide_mode_and_5b_preset(client):
 def test_presets_endpoint(client):
     names = [p["name"] for p in client.get("/api/presets").json()]
     assert "final-14b" in names
+
+
+def test_start_background_is_followed_by_the_other_keyframes(client):
+    job = _job_with_keyframes(client, n=3)
+    kfs = job["keyframes"]
+    client.post(f"/api/keyframes/{kfs[1]['id']}/match", json={})
+    r = client.post(f"/api/keyframes/{kfs[0]['id']}/match", json={"background": "#f5f5f5"})
+    assert r.status_code == 200, r.text
+    assert r.json()["match_params"]["background"] == [245, 245, 245]
+    assert r.json()["version"] != kfs[0]["version"]
+    d = paths.keyframes_dir(job["id"])
+    assert Image.open(d / "0.png").getpixel((0, 0)) == (245, 245, 245)
+    after = client.get(f"/api/jobs/{job['id']}").json()["keyframes"]
+    for k in after[1:]:
+        assert k["match_params"]["background"] == [245, 245, 245]
+    assert after[1]["match_params"]["color_match"] is True  # its own match settings are kept
+    assert Image.open(d / "2.png").getpixel((0, 0)) == (245, 245, 245)  # unmatched: flattened on it
+    # A keyframe uploaded later is flattened on the start's background too.
+    r = client.post(f"/api/jobs/{job['id']}/keyframes", data={"position": 3},
+                    files={"file": ("3.png", png_bytes(portrait()), "image/png")})
+    assert r.json()["match_params"]["background"] == [245, 245, 245]
+
+
+def test_front_is_served(client):
+    r = client.get("/")
+    assert r.status_code == 200 and "app.js" in r.text
+    assert client.get("/app.js").status_code == 200
+    assert client.get("/api/presets").json()[0]["estimates"]

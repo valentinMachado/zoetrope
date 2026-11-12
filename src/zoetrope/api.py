@@ -1,6 +1,8 @@
 """HTTP API. Light, own venv, restartable without touching a render: it only reads and writes the
 SQLite base, the worker does the rendering. The front polls it (no WebSocket).
 
+Also serves the job files at /files and the front (src/zoetrope/front) at /.
+
 Run: `.venv/Scripts/python -m uvicorn zoetrope.api:app --port 8765` (see scripts/start-api.ps1).
 """
 
@@ -181,3 +183,5 @@ def get_worker(conn=Conn):
 
 paths.jobs_dir().mkdir(parents=True, exist_ok=True)
 app.mount("/files", StaticFiles(directory=paths.jobs_dir(), check_dir=False), name="files")
+# The front: static files, no build step. Mounted last so /api and /files win.
+app.mount("/", StaticFiles(directory=paths.FRONT_DIR, html=True), name="front")

@@ -47,7 +47,8 @@ class Preset:
         return {
             "name": self.name, "label": self.label, "tier": self.tier, "end_frame": self.end_frame,
             "fps": self.fps, "memory_profile": self.memory_profile, "model_type": self.model_type,
-            "style": self.style, "loras": self.loras, "notes": self.notes,
+            "style": self.style, "loras": self.loras, "notes": self.notes, "estimates": self.estimates,
+            "steps": self.settings.get("num_inference_steps"), "resolution": self.settings.get("resolution"),
         }
 
 

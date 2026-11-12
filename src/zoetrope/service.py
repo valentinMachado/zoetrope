@@ -146,6 +146,17 @@ def _start_image(conn: sqlite3.Connection, job_id: int) -> Image.Image | None:
     return Image.open(r[0]).convert("RGB") if r else None
 
 
+def _start_params(conn: sqlite3.Connection, job_id: int) -> images.PrepParams | None:
+    r = conn.execute("SELECT match_params FROM keyframe WHERE job_id = ? AND position = 0", (job_id,)).fetchone()
+    return _params(r[0]) if r else None
+
+
+def _params(text: str | None) -> images.PrepParams:
+    params = images.PrepParams(**db.loads(text, {}))
+    params.background = tuple(params.background)
+    return params
+
+
 def _deviations(orig: Image.Image, prepared: Image.Image, params: images.PrepParams,
                 start: Image.Image) -> dict[str, Any]:
     before = images.flatten(orig, params.background, remove_fringes=False)
@@ -161,7 +172,9 @@ def add_keyframe(conn: sqlite3.Connection, job_id: int, position: int, data: byt
     orig = _open_image(data)
     d = paths.keyframes_dir(job_id)
     orig_file, file = d / f"{position}_orig.png", d / f"{position}.png"
-    params = images.PrepParams()
+    # Every keyframe is flattened on the start image's background colour.
+    start_params = _start_params(conn, job_id)
+    params = images.PrepParams(background=start_params.background) if start_params else images.PrepParams()
     start = None if position == 0 else _start_image(conn, job_id)
     prepared = images.prepare(orig, params, start)
     images.save_png(orig, orig_file)
@@ -178,34 +191,47 @@ def add_keyframe(conn: sqlite3.Connection, job_id: int, position: int, data: byt
         )
         _sync_segments(conn, job_id)
     if position == 0:
-        _refresh_deviations(conn, job_id)
+        _reprepare_others(conn, job_id)
     return public_keyframe(db.row(conn.execute(
         "SELECT * FROM keyframe WHERE job_id = ? AND position = ?", (job_id, position)).fetchone()))
 
 
-def _refresh_deviations(conn: sqlite3.Connection, job_id: int) -> None:
-    """After the start image changes: recompute the deviation of the other keyframes (not their
-    match, which the user re-runs if wanted)."""
+def _reprepare_others(conn: sqlite3.Connection, job_id: int) -> None:
+    """After the start image changes (new upload or new background): prepare the other keyframes
+    again against it, each with its own match settings and the start's background colour."""
     start = _start_image(conn, job_id)
+    background = _start_params(conn, job_id).background
     for k in db.rows(conn.execute("SELECT * FROM keyframe WHERE job_id = ? AND position > 0", (job_id,)).fetchall()):
-        params = images.PrepParams(**{**db.loads(k["match_params"], {})})
-        params.background = tuple(params.background)
-        dev = _deviations(Image.open(k["orig_file"]), Image.open(k["file"]).convert("RGB"), params, start)
-        db.update(conn, "keyframe", k["id"], deviation=json.dumps(dev))
+        params = _params(k["match_params"])
+        params.background = background
+        orig = Image.open(k["orig_file"])
+        prepared = images.prepare(orig, params, start)
+        images.save_png(prepared, Path(k["file"]))
+        dev = _deviations(orig, prepared, params, start)
+        db.update(conn, "keyframe", k["id"], match_params=json.dumps(params.to_json()), deviation=json.dumps(dev))
 
 
 def match_keyframe(conn: sqlite3.Connection, keyframe_id: int, *, enabled: bool = True,
                    color_match: bool = True, remove_fringes: bool = True,
                    background: str = "#ffffff") -> dict[str, Any]:
     """Technical match of a keyframe onto the start image: same size and framing, alpha flattened
-    on the same colour with fringes removed, colours matched; `enabled=False` undoes it."""
+    on the same colour with fringes removed, colours matched; `enabled=False` undoes it.
+
+    On the start image (position 0), the reference, only the background colour and the fringe
+    removal apply; the other keyframes are then prepared again on that background. An off-white
+    background does not cure the 14B greying pure white (docs/benchmark.md, P6)."""
     k = _get(conn, "keyframe", keyframe_id)
-    if k["position"] == 0:
-        raise Invalid("The start image is the reference: nothing to match it to")
     try:
         bg = images.parse_color(background)
     except ValueError as e:
         raise Invalid(str(e)) from None
+    if k["position"] == 0:
+        params = images.PrepParams(background=bg, remove_fringes=remove_fringes)
+        images.save_png(images.prepare(Image.open(k["orig_file"]), params, None), Path(k["file"]))
+        with db.transaction(conn):
+            db.update(conn, "keyframe", keyframe_id, match_params=json.dumps(params.to_json()))
+            _reprepare_others(conn, k["job_id"])
+        return public_keyframe(_get(conn, "keyframe", keyframe_id))
     params = images.PrepParams(background=bg, remove_fringes=remove_fringes,
                                fit=enabled, color_match=enabled and color_match)
     start = _start_image(conn, k["job_id"])
@@ -234,8 +260,10 @@ def public_keyframe(k: dict[str, Any]) -> dict[str, Any]:
     k["match_params"] = db.loads(k["match_params"])
     k["deviation"] = db.loads(k["deviation"])
     k["orig_url"] = paths.to_url(k.pop("orig_file"))
-    k["url"] = paths.to_url(k.pop("file"))
-    k["version"] = k["created_at"]
+    file = k.pop("file")
+    k["url"] = paths.to_url(file)
+    # Changes whenever the prepared image is rewritten (upload, match): the front's cache buster.
+    k["version"] = Path(file).stat().st_mtime_ns if Path(file).is_file() else 0
     return k
 
 
