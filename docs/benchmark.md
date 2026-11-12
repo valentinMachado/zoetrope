@@ -447,6 +447,61 @@ image created by Klein from the start is the way to hold the style through the m
 edit keeps its source's style); the prompt rules stop asking for a style when it is set, and the
 AI review is told it is added.
 
+## Following a fine motion prompt: the wink (P14)
+
+Job 4's take #10 ("She slowly smiles, then winks. Static camera.", FLF 14B to a Klein smiling
+end image) closed both eyes, and before the smile, not after. The 14B Lightning runs 4 steps
+without CFG, so the prompt weighs little against the two images. Measured on a copy of job 4
+(job 7: same start image, same smiling end keyframe after the match, pixel-identical, same
+style and seed 1999376551), all through Zoetrope, 2026-11-12. Clips in `outputs/jobs/7/takes/`,
+contact sheets and the joined wink in `outputs/p14/` (not tracked).
+
+| Take | Segment | Prompt (after the style) | Frames | Time | Eyes |
+|---|---|---|---|---|---|
+| #10 (job 4) | start → smile | She slowly smiles, then winks. | 41 (2.5 s) | 24 min 11 s | both close, before the smile |
+| #11 | start → smile | She slowly smiles, then winks: she closes only her left eye while her right eye stays open. | 41 | 23 min 26 s | smile first, then **both close** (frames 24-32) |
+| #15 | same | same | **61 (3.8 s)** | 28 min 22 s | both closed longer (frames 33-54) |
+| #12, preview | start only | same | 61 at 24 fps | 9 min (5 min 46 s 5B load) | smile, then both close |
+| #14 | smile → **wink keyframe** | She winks one eye while she keeps smiling. | 25 (1.5 s) | 15 min 17 s | both squint mid-clip (laugh), the wink only on the last 2 frames |
+| **#16** | smile → wink keyframe | She **slowly closes her right eye** in a wink; her **left eye stays open** and she keeps the same smile. | 25 | 13 min 47 s | **one eye closes from frame 12, closed from 16; the other open throughout** |
+| #17 | wink keyframe → smile | She opens her right eye again and keeps the same smile. | 25 | 13 min 57 s | reopens, with a short blink of both eyes at frame 4 |
+| #13, preview | smile only | She winks one eye while she keeps smiling. | 37 at 24 fps | 1 min 58 s | both close |
+
+The wink keyframe (keygen #6) was made by Klein from the smiling keyframe: "Make her wink: she
+closes only her left eye, her right eye stays wide open. She keeps smiling." Three draws (two
+from the smile, one from the start image), **all three a clean one-eye wink**, 30 s each with
+Klein loaded (2 min 19 s for the first, Klein loaded after the 14B). Klein closed her right eye
+each time: it read "left" as the viewer's left. The draw from the start image smiles wider and
+redraws the face more; the draws from the smile keep it.
+
+- **Rewording alone does not do it.** Naming the eye that closes and the one that stays open put
+  the two gestures in the right order, but the 14B still closed both eyes. FastWan does the same.
+- **More frames do not do it either**: 61 frames give the same two closed eyes, held longer. They
+  cost 1.2 times the 41-frame time (28 min 22 s against 23 min 26 s). RAM and VRAM peaks are those
+  of 41 frames (31.7 GB used, 0.2 GB available, VRAM 5.1 GB), so 14B shots longer than 41
+  frames are possible on this machine.
+- **A keyframe of the gesture does it, with an explicit prompt.** FLF to Klein's wink image gives
+  a one-eye wink, but with a short prompt ("winks one eye") the eyes squint together in between
+  and the wink only appears on the last two frames, imposed by the end image (#14). With a
+  prompt that says the gesture eye by eye and slowly, matching the keyframe's side (#16), the eye
+  closes over the clip and the other one stays open: the wink is performed, not just imposed.
+  The two prompts differ in several words, so which ones count is not isolated.
+- **A gesture that comes back needs two segments**: smile → wink (#16) then wink → smile (#17,
+  the end image a second copy of the smile keyframe). Joined, they give a full 3 s wink. The
+  reopening blinks once, and the seam between the two clips differs by 6.9 grey levels (the end
+  of #16 against the wink keyframe 7.6). Assembled by hand with ffmpeg, not through Zoetrope.
+- **The preview cannot judge such a gesture**: with no end image, FastWan closes both eyes
+  whatever the wording, from the start image (#12) or from the smile (#13). It shows the timing,
+  not whether a keyframe-held gesture will work.
+- The watercolour holds in every 14B take (P9); the face is redrawn with a little more outline
+  when it laughs (#14, #15).
+
+**Consequences** (P15): a fine, asymmetric gesture (a wink, one hand, one eyebrow) is not
+reachable from text with this 14B: it needs a keyframe of the gesture made by Klein from the
+previous keyframe, one gesture per segment, a prompt that describes the gesture part by part
+on the keyframe's side, and, for a gesture that returns, a second segment back to a copy of
+the previous keyframe. The FastWan preview does not show it.
+
 ## Recommendation
 
 **5B for previews.** It fits comfortably (5.7 GB VRAM, 24 GB RAM). FastWan (3 steps): 4 min
@@ -470,6 +525,10 @@ source images, the start image as a possible target).
 **Painted images**: the 14B keeps a watercolour, FastWan does not (cut at frame 4); an end
 image made by Klein from the start keeps it through the whole move (section above). No style
 LoRA exists for Wan; training one is the brief's last resort.
+
+**Fine gestures** (a wink): text alone does not get them from the 14B Lightning, whatever the
+wording or the length; a keyframe of the gesture made by Klein, an explicit prompt and one
+segment per gesture do (section above).
 
 **ComfyUI: not yet.** Wan2GP already provides everything the brief expects from ComfyUI:
 headless runs (`wgp.py --process settings.json`), a Python API (`WanGPSession`) and an MCP
