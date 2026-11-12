@@ -44,7 +44,9 @@ Two processes that talk only through `outputs/zoetrope.db` (SQLite, WAL):
 
 The front (`src/zoetrope/front/`: one HTML page, plain JS, no build step) polls the API and
 only rebuilds the parts whose data changed, so a playing video or a prompt being typed survives
-a refresh. Frames are extracted in the browser (canvas) and uploaded as keyframes.
+a refresh. Frames are extracted in the browser (canvas) and uploaded as keyframes. The job page
+follows the user's path in five steps and says what to do next from the job's state
+(`nextStep()` in `app.js`); fine settings sit in folded « Avancé » blocks.
 
 Queue order, take/assembly lifecycle and keyframe preparation are documented in the module
 docstrings (`queue.py`, `service.py`, `worker.py`, `images.py`, `assembly.py`).
@@ -68,7 +70,9 @@ Wan2GP's venv is Python 3.10.9 + torch 2.7.1+cu126, created with `uv`.
 
 ## Rules
 
-1. Everything tracked by git is in **English**, except the brief. The user writes in
-   French; replies to the user are in French.
+1. Everything tracked by git is in **English**, except the brief and the front's user-facing
+   text (labels, help, messages in `src/zoetrope/front/`), which is in **French** at the user's
+   request; the front's code and comments stay in English. The user writes in French; replies
+   to the user are in French.
 2. Ask before downloading any single file over 5 GB.
 3. If a step fails twice, stop and explain the blocker instead of chaining workarounds.

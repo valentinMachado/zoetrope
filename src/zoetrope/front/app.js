@@ -1,5 +1,13 @@
 // Zoetrope front: one page, no build step. It polls the API (no WebSocket) and only rebuilds the
 // parts of the page whose data changed, so a playing video or a prompt being typed is never reset.
+//
+// The user-facing text is in French (exception to rule 1 of CLAUDE.md, decided in P7); code and
+// comments stay in English. The API keeps its own names: keyframe = « image clé », segment =
+// « plan », take = « prise », retained take = « prise gardée pour le montage », assembly = « montage ».
+//
+// The job page follows the user's path in five steps (STEPS): start image, preview, final render,
+// keep a take, assembly. nextStep() reads the job's state and says what to do now; the button that
+// does it is outlined (data-next / .is-next).
 "use strict";
 
 const POLL_ACTIVE_MS = 2000;
@@ -66,7 +74,7 @@ async function act(fn, { refresh = true } = {}) {
     if (refresh) await refreshNow();
     return r;
   } catch (e) {
-    toast(e.message);
+    toast(`Erreur : ${e.message}`);
     return undefined;
   }
 }
@@ -80,8 +88,13 @@ function fmtDuration(s) {
   return `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, "0")} min`;
 }
 
+function fmtMinutes(s) { // for estimates: "~5 min"
+  if (!s) return "";
+  return s < 90 ? `~${Math.max(1, Math.round(s))} s` : `~${Math.round(s / 60)} min`;
+}
+
 function fmtDate(t) {
-  return new Date(t * 1000).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" });
+  return new Date(t * 1000).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" });
 }
 
 function framesFor(durationS, fps) { // same rule as presets.frames_for: Wan models take 4n+1 frames
@@ -93,19 +106,47 @@ function preset(name) { return state.presets.find((p) => p.name === name); }
 
 function kfUrl(k) { return k ? `${k.url}?v=${k.version}` : null; }
 
-function badge(status) { return h("span", { class: `badge s-${status}` }, status); }
+const STATUS_LABELS = {
+  draft: "brouillon", ready: "prises choisies", queued: "en attente", running: "en cours", done: "terminé",
+  failed: "échec", cancelled: "annulé",
+};
+
+function badge(status) { return h("span", { class: `badge s-${status}` }, STATUS_LABELS[status] || status); }
 
 const PHASE_LABELS = {
-  starting: "starting", loading_model: "loading the model", encoding_text: "encoding the prompt",
-  inference: "denoising", decoding: "decoding", saving: "saving",
+  starting: "démarrage", loading_model: "chargement du modèle", encoding_text: "lecture du prompt",
+  inference: "génération", decoding: "décodage", saving: "enregistrement",
 };
+
+const TIER_LABELS = { preview: "aperçu", final: "rendu final" };
+
+// Folded block whose open state survives the rebuilds of its card (a polled take is rebuilt
+// every few seconds).
+const openFolds = new Set();
+
+function fold(key, cls, label, ...children) {
+  const d = h("details", { class: cls, open: openFolds.has(key) }, h("summary", {}, label), ...children);
+  d.addEventListener("toggle", () => {
+    if (!d.open) { openFolds.delete(key); return; }
+    if (openFolds.has(key)) return; // reopened by a rebuild: restoreLogScrolls placed it
+    openFolds.add(key);
+    for (const pre of d.querySelectorAll("pre.log")) pre.scrollTop = pre.scrollHeight; // newest lines
+  });
+  return d;
+}
+
+// « Avancé » block; the first child may be a string that replaces that label.
+function advanced(key, ...children) {
+  const label = typeof children[0] === "string" ? children.shift() : "Avancé";
+  return fold(`adv-${key}`, "adv", label, ...children);
+}
 
 // Keyed list: rebuild an item only when its signature changes, keep the others (and their videos).
 function syncList(container, items, keyOf, sigOf, render) {
   const old = new Map();
   for (const el of [...container.children]) {
     if (el.dataset.key) old.set(el.dataset.key, el);
-    else el.remove(); // a placeholder such as "No take yet."
+    else el.remove(); // a placeholder such as "Pas encore de prise."
   }
   let prev = null;
   for (const item of items) {
@@ -116,7 +157,9 @@ function syncList(container, items, keyOf, sigOf, render) {
       const fresh = render(item);
       fresh.dataset.key = key;
       fresh.dataset.sig = sig;
+      const scrolls = logScrolls(el); // measured while el is still laid out
       if (el) el.replaceWith(fresh);
+      restoreLogScrolls(fresh, scrolls);
       el = fresh;
     }
     old.delete(key);
@@ -125,6 +168,26 @@ function syncList(container, items, keyOf, sigOf, render) {
     prev = el;
   }
   for (const el of old.values()) el.remove();
+}
+
+// A rebuilt log keeps where its reader was: following the end (the default, newest lines) or
+// reading higher up.
+// null = following the end.
+function logScrolls(el) {
+  return el ? [...el.querySelectorAll("pre.log")].map((p) =>
+    p.scrollHeight - p.scrollTop - p.clientHeight < 8 ? null : p.scrollTop) : [];
+}
+
+function restoreLogScrolls(el, scrolls) {
+  [...el.querySelectorAll("pre.log")].forEach((pre, i) => {
+    pre.scrollTop = scrolls[i] ?? pre.scrollHeight;
+  });
+}
+
+function syncOne(container, sig, render) {
+  if (container.dataset.sig === sig) return;
+  container.dataset.sig = sig;
+  container.replaceChildren(...[render(state.job)].flat(Infinity));
 }
 
 // --- routing and polling ------------------------------------------------------------------------
@@ -182,7 +245,7 @@ async function refreshOnce() {
     }
   } catch (e) {
     document.getElementById("app").replaceChildren(
-      h("p", {}, h("a", { href: "#/" }, "← Jobs")), h("p", { class: "error" }, e.message));
+      h("p", {}, h("a", { href: "#/" }, "← Mes projets")), h("p", { class: "error" }, e.message));
   }
 }
 
@@ -201,32 +264,35 @@ function queueItem(kind, id) {
 function renderTopbar(error) {
   const pill = document.getElementById("worker-pill");
   const banner = document.getElementById("banner");
-  banner.className = "";
   if (error) {
     pill.className = "pill bad";
-    pill.textContent = "API unreachable";
+    pill.textContent = "API injoignable";
     banner.hidden = false;
-    banner.textContent = `The API does not answer (${error.message}). Start it with scripts\\start-api.ps1.`;
+    banner.textContent = `L'API ne répond pas (${error.message}). Lance-la avec scripts\\start-api.ps1.`;
     return;
   }
   const w = state.queue.worker;
   const q = state.queue;
   if (w.alive) {
-    const cur = w.current_kind ? `${w.current_kind} ${w.current_id}` : "idle";
+    const cur = w.current_kind
+      ? (w.current_kind === "take" ? `rend la prise #${w.current_id}` : `monte (montage ${w.current_id})`)
+      : "prêt, rien à faire";
     pill.className = "pill ok";
-    pill.textContent = `worker: ${cur}`;
-    pill.title = `pid ${w.pid} · model ${w.loaded_model || "none"}${w.loaded_model ? ` (profile ${w.loaded_profile})` : ""}` +
-      ` · heartbeat ${w.heartbeat_age_s} s ago`;
+    pill.textContent = `Moteur de rendu : ${cur}`;
+    pill.title = `pid ${w.pid} · modèle ${w.loaded_model || "aucun"}${w.loaded_model ? ` (profil ${w.loaded_profile})` : ""}` +
+      ` · dernier signe de vie il y a ${w.heartbeat_age_s} s`;
   } else {
     pill.className = "pill bad";
-    pill.textContent = "worker absent";
-    pill.title = w.heartbeat_age_s ? `last heartbeat ${fmtDuration(w.heartbeat_age_s)} ago` : "not running";
+    pill.textContent = "Moteur de rendu arrêté";
+    pill.title = "Les rendus ne démarrent que s'il tourne : scripts\\start-worker.ps1" +
+      (w.heartbeat_age_s ? ` (dernier signe de vie il y a ${fmtDuration(w.heartbeat_age_s)})` : "");
   }
   banner.hidden = w.alive || q.items.length === 0;
-  banner.textContent = "Tasks are waiting but the worker is not running: start it with scripts\\start-worker.ps1.";
+  banner.textContent = "Des rendus attendent mais le moteur de rendu est arrêté : lance scripts\\start-worker.ps1.";
 
   const toggle = document.getElementById("queue-toggle");
-  toggle.textContent = q.items.length ? `Queue: ${q.items.length} · ${fmtDuration(q.total_s)}` : "Queue: empty";
+  toggle.textContent = q.items.length
+    ? `File d'attente : ${q.items.length} · ${fmtDuration(q.total_s)}` : "File d'attente : vide";
   renderQueuePanel();
 }
 
@@ -240,31 +306,34 @@ function renderQueuePanel() {
   const w = state.queue.worker;
   const rows = state.queue.items.map((i) => {
     const what = i.kind === "take"
-      ? `take ${i.id} · segment ${i.segment_idx + 1} · ${i.tier} (${i.preset})`
-      : `assembly ${i.id}`;
+      ? `plan ${i.segment_idx + 1} · ${TIER_LABELS[i.tier] || i.tier} (prise #${i.id})`
+      : `montage ${i.id}`;
     let where = "";
     if (i.status === "running") {
-      where = PHASE_LABELS[i.phase] || i.phase || "starting";
+      where = PHASE_LABELS[i.phase] || i.phase || "démarrage";
       if (i.phase === "inference" && i.total_steps) where += ` ${i.step || 0}/${i.total_steps}`;
-      where += ` · ${fmtDuration(i.remaining_s)} left`;
+      where += ` · encore ${fmtDuration(i.remaining_s)}`;
     } else {
-      where = `starts in ${fmtDuration(i.starts_in_s)} · ~${fmtDuration(i.remaining_s)}`;
+      where = `commence dans ${fmtDuration(i.starts_in_s)} · dure ~${fmtDuration(i.remaining_s)}`;
     }
     return h("li", { class: i.status },
-      h("a", { href: `#/job/${i.job_id}` }, `job ${i.job_id}`), " · ", what, h("div", { class: "muted" }, where));
+      h("a", { href: `#/job/${i.job_id}` }, `projet ${i.job_id}`), " · ", what, h("div", { class: "muted" }, where));
   });
+  const top = panel.scrollTop; // emptying the panel would scroll it back to the top
   panel.replaceChildren(
-    h("h3", {}, "Queue"),
+    h("h3", {}, "File d'attente"),
     h("p", { class: "muted" },
       w.alive
-        ? `Worker pid ${w.pid}, model loaded: ${w.loaded_model || "none"}` +
-          (w.loaded_model ? ` (profile ${w.loaded_profile})` : "")
-        : "Worker not running."),
-    rows.length ? h("ol", {}, rows) : h("p", {}, "Nothing queued."),
-    rows.length ? h("p", { class: "muted" }, `Everything done in about ${fmtDuration(state.queue.total_s)}.`) : null,
+        ? `Moteur de rendu actif (pid ${w.pid}), modèle chargé : ${w.loaded_model || "aucun"}` +
+          (w.loaded_model ? ` (profil ${w.loaded_profile})` : "")
+        : "Moteur de rendu arrêté : lance scripts\\start-worker.ps1."),
+    rows.length ? h("ol", {}, rows) : h("p", {}, "Rien en attente."),
+    rows.length ? h("p", { class: "muted" }, `Tout sera fini dans ${fmtDuration(state.queue.total_s)} environ.`) : null,
     h("p", { class: "muted small" },
-      "Order: previews first, then assemblies, then final renders grouped by model (a model change reloads it)."),
+      "Ordre : les aperçus d'abord, puis les montages, puis les rendus finaux regroupés par modèle " +
+      "(changer de modèle le recharge). Tu peux fermer la page : les rendus continuent."),
   );
+  panel.scrollTop = top;
 }
 
 // --- jobs list ----------------------------------------------------------------------------------
@@ -274,25 +343,46 @@ function renderJobs(jobs) {
   if (!app.querySelector(".jobs-view")) {
     const finals = state.presets.filter((p) => p.tier === "final");
     const form = h("form", { class: "card new-job", onsubmit: createJob },
-      h("h2", {}, "New job"),
-      h("label", {}, "Title", h("input", { name: "title", placeholder: "e.g. watercolour harbour, boats rocking" })),
-      h("label", {}, "Final render",
-        h("select", { name: "preset_final" },
-          finals.map((p) => h("option", { value: p.name, selected: p.name === "final-14b" }, p.label)))),
-      h("label", {}, "End of the last segment", endModeSelect("exact")),
-      h("button", { type: "submit", class: "primary" }, "Create"),
+      h("h2", {}, "Nouveau projet"),
+      h("label", {}, "Titre", h("input", { name: "title", placeholder: "ex. port à l'aquarelle, bateaux qui tanguent" })),
+      advanced("new-job",
+        h("label", {}, "Modèle du rendu final",
+          h("select", { name: "preset_final" },
+            finals.map((p) => h("option", { value: p.name, selected: p.name === "final-14b" }, p.label)))),
+        h("label", {}, "Fin du dernier plan (si tu ajoutes une image de fin)", endModeSelect("exact"))),
+      h("button", { type: "submit", class: "primary" }, "Créer"),
     );
-    app.replaceChildren(h("section", { class: "jobs-view" }, form, h("div", { class: "job-grid" })));
+    app.replaceChildren(h("section", { class: "jobs-view" },
+      h("div", { class: "jobs-side" }, form, howItWorks()),
+      h("div", {}, h("h2", { class: "first" }, "Mes projets"), h("div", { class: "job-grid" }))));
   }
   const grid = app.querySelector(".job-grid");
   syncList(grid, jobs, (j) => j.id, (j) => JSON.stringify(j), (j) =>
     h("a", { class: "card job-card", href: `#/job/${j.id}` },
-      j.thumbnail_url ? h("img", { src: j.thumbnail_url, alt: "" }) : h("div", { class: "no-thumb" }, "no image"),
+      j.thumbnail_url ? h("img", { src: j.thumbnail_url, alt: "" }) : h("div", { class: "no-thumb" }, "pas d'image"),
       h("div", { class: "job-card-body" },
-        h("strong", {}, j.title || `Job ${j.id}`),
+        h("strong", {}, j.title || `Projet ${j.id}`),
         h("div", {}, badge(j.status), " ", h("span", { class: "muted" }, fmtDate(j.created_at))),
       )));
-  if (!jobs.length) grid.replaceChildren(h("p", { class: "muted" }, "No job yet."));
+  if (!jobs.length) grid.replaceChildren(h("p", { class: "muted" }, "Aucun projet pour l'instant : crée le premier à gauche."));
+}
+
+function howItWorks() {
+  const prev = preset("preview");
+  const fin = preset("final-14b") || state.presets.find((p) => p.tier === "final");
+  return h("div", { class: "card how" },
+    h("h3", {}, "Comment ça marche"),
+    h("ol", {},
+      h("li", {}, "Crée un projet et dépose une image : photo, aquarelle, dessin."),
+      h("li", {}, "Décris ce qui bouge, puis lance un ", h("b", {}, "aperçu"),
+        ` (modèle rapide, ${fmtMinutes(prev && estimate(prev)) || "quelques minutes"}) pour vérifier le mouvement.`),
+      h("li", {}, "Quand le mouvement te va, lance le ", h("b", {}, "rendu final"),
+        ` (meilleure qualité, ${fmtMinutes(fin && estimate(fin)) || "long"}) : il passe en file, la nuit par exemple.`),
+      h("li", {}, h("b", {}, "Garde"), " la prise qui te plaît."),
+      h("li", {}, h("b", {}, "Monte"), " la vidéo et télécharge-la.")),
+    h("p", { class: "muted small" },
+      "Pour imposer la fin du mouvement, ajoute une 2ᵉ image : le rendu final arrivera dessus. ",
+      "Avec plusieurs images, la vidéo a un plan entre chaque paire d'images, montés bout à bout."));
 }
 
 async function createJob(ev) {
@@ -304,40 +394,176 @@ async function createJob(ev) {
 
 function endModeSelect(value, onchange) {
   return h("select", { name: "end_mode", onchange },
-    h("option", { value: "exact", selected: value === "exact" }, "exact: the video reaches the last keyframe"),
+    h("option", { value: "exact", selected: value === "exact" }, "finir exactement sur la dernière image"),
     h("option", { value: "guide", selected: value === "guide" },
-      "guide: start image only, the last keyframe only judges the preview"));
+      "dernière image indicative : le rendu final part de l'image de départ seule"));
+}
+
+// --- the path through a job ---------------------------------------------------------------------
+
+const STEPS = [
+  { n: 1, label: "Image de départ", section: "step-images" },
+  { n: 2, label: "Aperçu", section: "step-shots" },
+  { n: 3, label: "Rendu final", section: "step-shots" },
+  { n: 4, label: "Garder une prise", section: "step-shots" },
+  { n: 5, label: "Montage", section: "step-assembly" },
+];
+
+const isLive = (x) => x.status === "queued" || x.status === "running";
+const doneOf = (s, tier) => s.takes.filter((t) => t.status === "done" && (!tier || t.tier === tier));
+
+// Which of the five steps are done, for the whole job.
+function stepsDone(job) {
+  const segs = job.segments;
+  const all = (f) => segs.length > 0 && segs.every((s) => s.retained_take_id || f(s));
+  return {
+    1: job.keyframes.length > 0,
+    2: job.keyframes.length > 0 && all((s) => doneOf(s).length > 0),
+    3: job.keyframes.length > 0 && all((s) => doneOf(s, "final").length > 0),
+    4: job.keyframes.length > 0 && segs.length > 0 && segs.every((s) => s.retained_take_id),
+    5: job.assemblies.some((a) => a.status === "done"),
+  };
+}
+
+// What to do now: { text, target (data-next of the element to outline), wait (a render runs) }.
+function nextStep(job) {
+  const n = findNextStep(job);
+  n.text = n.text.replace(/\s+/g, " ").replace(/ ([,.])/g, "$1"); // optional words leave gaps
+  return n;
+}
+
+function findNextStep(job) {
+  if (!job.keyframes.length) {
+    return { text: "Dépose l'image de départ (photo, aquarelle, dessin) à l'étape 1.", target: "add-kf" };
+  }
+  const multi = job.segments.length > 1;
+  const name = (s) => (multi ? `du plan ${s.idx + 1}` : "");
+  let waiting = null;
+  for (const s of job.segments) {
+    if (s.retained_take_id) continue;
+    const live = s.takes.find(isLive);
+    if (live) {
+      waiting = waiting || { s, t: live };
+      continue;
+    }
+    const last = s.takes[s.takes.length - 1];
+    if (last && last.status === "failed") {
+      return { text: `La dernière prise ${name(s)} a échoué (erreur sous la prise). Corrige si besoin et relance.`,
+        target: `preview-${s.id}` };
+    }
+    if (!s.prompt.trim()) {
+      return { text: `Décris ce qui doit bouger ${multi ? `dans le plan ${s.idx + 1}` : ""}, puis lance un aperçu.`,
+        target: `prompt-${s.id}` };
+    }
+    const finals = doneOf(s, "final");
+    if (finals.length) {
+      return { text: `Le rendu final ${name(s)} est prêt : regarde-le, puis coche « Garder pour le montage » ` +
+        "sur la prise qui te plaît.", target: `retain-${finals[finals.length - 1].id}` };
+    }
+    if (doneOf(s, "preview").length) {
+      return { text: `Regarde l'aperçu ${name(s)}. Le mouvement te va ? Lance le rendu final. ` +
+        "Sinon, change le prompt et refais un aperçu.", target: `final-${s.id}` };
+    }
+    return { text: `Lance un aperçu ${name(s)} pour vérifier le mouvement (quelques minutes).`,
+      target: `preview-${s.id}` };
+  }
+  const workerOff = state.queue.worker.alive ? "" : " Le moteur de rendu est arrêté : lance scripts\\start-worker.ps1.";
+  if (waiting) {
+    const q = queueItem("take", waiting.t.id);
+    const when = waiting.t.status === "running"
+      ? `en cours${q ? `, encore ${fmtDuration(q.remaining_s)} environ` : ""}`
+      : `en attente${q ? `, commence dans ${fmtDuration(q.starts_in_s)}` : ""}`;
+    return { text: `${TIER_LABELS[waiting.t.tier][0].toUpperCase()}${TIER_LABELS[waiting.t.tier].slice(1)} ` +
+      `${name(waiting.s)} ${when}. Tu peux fermer la page : le rendu continue.` + workerOff,
+    target: `take-${waiting.t.id}`, wait: true };
+  }
+  const liveAsm = job.assemblies.find(isLive);
+  if (liveAsm) return { text: "Montage en cours." + workerOff, target: `asm-${liveAsm.id}`, wait: true };
+  const doneAsm = [...job.assemblies].reverse().find((a) => a.status === "done");
+  if (doneAsm) {
+    return { text: "La vidéo est prête : télécharge-la en bas de page. Tu peux encore changer de prise et remonter.",
+      target: `download-${doneAsm.id}`, done: true };
+  }
+  return { text: "Toutes les prises sont choisies : monte la vidéo (étape 5).", target: "assemble" };
+}
+
+function renderStepper(job) {
+  const done = stepsDone(job);
+  const current = STEPS.find((s) => !done[s.n])?.n;
+  return h("ol", { class: "stepper" }, STEPS.map((s) =>
+    h("li", { class: done[s.n] ? "done" : s.n === current ? "current" : "" },
+      h("a", { href: `#/job/${job.id}`, onclick: (ev) => { ev.preventDefault(); scrollToId(s.section); } },
+        h("span", { class: "num" }, done[s.n] ? "✓" : s.n), s.label))));
+}
+
+function renderNext(job) {
+  const n = nextStep(job);
+  return h("div", { class: `next-step${n.wait ? " wait" : ""}${n.done ? " done" : ""}` },
+    h("span", { class: "next-label" }, n.wait ? "En cours" : n.done ? "Terminé" : "À faire"),
+    h("span", { class: "next-text" }, n.text),
+    h("button", { type: "button", onclick: () => goTo(n.target) }, n.wait ? "Voir" : "Y aller"));
+}
+
+function scrollToId(id) {
+  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function goTo(target) {
+  const el = document.querySelector(`[data-next="${target}"]`);
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  const focusable = el.matches("textarea, input, button") ? el : el.querySelector("textarea, input, button");
+  if (focusable) setTimeout(() => focusable.focus({ preventScroll: true }), 400);
+}
+
+function highlightNext(target) {
+  for (const el of document.querySelectorAll(".is-next")) {
+    if (el.dataset.next !== target) el.classList.remove("is-next");
+  }
+  document.querySelector(`[data-next="${target}"]`)?.classList.add("is-next");
 }
 
 // --- job view -----------------------------------------------------------------------------------
+
+function section(id, num, title, intro) {
+  return h("section", { id, class: "step-section" },
+    h("h2", {}, h("span", { class: "step-num" }, num), title),
+    h("p", { class: "muted section-intro" }, intro));
+}
 
 function renderJob() {
   const job = state.job;
   const app = document.getElementById("app");
   let view = app.querySelector(".job-view");
   if (!view || Number(view.dataset.job) !== job.id) {
-    view = h("section", { class: "job-view", dataset: { job: job.id } },
-      h("div", { class: "job-head" }),
-      h("h2", {}, "Keyframes"),
-      h("p", { class: "muted small" },
-        "Keyframe 0 is the start image. Segment i goes from keyframe i to keyframe i+1; ",
-        "a single image gives one segment from the start image alone."),
-      h("div", { class: "keyframes" }),
-      h("h2", {}, "Segments"),
-      h("div", { class: "segments" }),
-      h("h2", {}, "Assembly"),
-      h("div", { class: "assembly" }),
-    );
+    const images = section("step-images", "1", "Images",
+      "L'image de départ est le premier plan de la vidéo. Une 2ᵉ image, facultative, impose la fin : " +
+      "le rendu final arrivera dessus. Avec plusieurs images, la vidéo a un plan entre chaque paire.");
+    images.append(h("div", { class: "keyframes" }));
+    const shots = section("step-shots", "2-4", "Plans : aperçu, rendu final, prise à garder",
+      "Pour chaque plan : décris le mouvement, vérifie-le avec un aperçu rapide, lance le rendu final " +
+      "quand il te va, puis garde la prise qui te plaît.");
+    shots.append(h("div", { class: "segments" }));
+    const assembly = section("step-assembly", "5", "Montage",
+      "Le montage colle bout à bout la prise gardée de chaque plan et donne la vidéo à télécharger.");
+    assembly.append(h("div", { class: "assembly" }));
+    view = h("div", { class: "job-view", dataset: { job: job.id } },
+      h("div", { class: "job-head" }), h("div", { class: "stepper-box" }), h("div", { class: "next-box" }),
+      images, shots, assembly);
     app.replaceChildren(view);
   }
   syncOne(view.querySelector(".job-head"), JSON.stringify([job.title, job.preset_final, job.end_mode, job.status,
-    state.presets.length]), renderJobHead);
+    job.keyframes.length, state.presets.length]), renderJobHead);
+  const next = nextStep(job);
+  syncOne(view.querySelector(".stepper-box"), JSON.stringify(stepsDone(job)), renderStepper);
+  syncOne(view.querySelector(".next-box"), JSON.stringify([next, state.queue.worker.alive]), renderNext);
   const kfs = view.querySelector(".keyframes");
   syncList(kfs, [...job.keyframes, { id: "add" }], (k) => k.id,
     (k) => k.id === "add" ? `add${job.keyframes.length}` : JSON.stringify([k, job.keyframes.length]),
     (k) => k.id === "add" ? renderAddKeyframe(job) : renderKeyframe(job, k));
   syncList(view.querySelector(".segments"), job.segments, (s) => s.id,
-    (s) => JSON.stringify([s.id, s.kf_in, s.kf_out, s.end_mode, job.preset_final, kfVersions(job, s)]),
+    (s) => JSON.stringify([s.id, s.kf_in, s.kf_out, s.end_mode, job.preset_final, job.segments.length,
+      kfVersions(job, s)]),
     (s) => renderSegment(job, s));
   for (const s of job.segments) updateSegment(job, s);
   syncOne(view.querySelector(".assembly"), JSON.stringify([job.segments.map((s) => s.retained_take_id),
@@ -345,12 +571,8 @@ function renderJob() {
       const q = queueItem("assembly", a.id);
       return q ? [q.status, Math.round(q.starts_in_s / 10)] : null;
     })]), renderAssembly);
-}
-
-function syncOne(container, sig, render) {
-  if (container.dataset.sig === sig) return;
-  container.dataset.sig = sig;
-  container.replaceChildren(...[render(state.job)].flat(Infinity));
+  view.querySelector("#step-shots").classList.toggle("locked", !job.keyframes.length);
+  highlightNext(next.target);
 }
 
 function kfVersions(job, s) {
@@ -362,19 +584,22 @@ function renderJobHead(job) {
   const patch = (field) => (ev) => act(() => api("PATCH", `/jobs/${job.id}`, { [field]: ev.target.value }));
   return [
     h("div", { class: "row" },
-      h("a", { href: "#/" }, "← Jobs"),
-      h("input", { class: "title-input", value: job.title, placeholder: `Job ${job.id}`, onchange: patch("title") }),
+      h("a", { href: "#/" }, "← Mes projets"),
+      h("input", { class: "title-input", value: job.title, placeholder: `Projet ${job.id}`, onchange: patch("title"),
+        title: "Titre du projet (clique pour le changer)" }),
       badge(job.status)),
-    h("div", { class: "row settings" },
-      h("label", {}, "Final render",
-        h("select", { onchange: patch("preset_final") },
-          finals.map((p) => h("option", { value: p.name, selected: p.name === job.preset_final }, p.label)))),
-      h("label", {}, "End of the last segment", endModeSelect(job.end_mode, patch("end_mode")))),
-    h("p", { class: "muted small" },
-      job.end_mode === "guide"
-        ? "Guide: the final render of the last segment starts from its start image alone and the prompt leads the " +
-          "end; its end keyframe only serves to judge the preview. Inner segments always reach their keyframe."
-        : "Exact: every segment's final render reaches its end keyframe (first and last frame, 14B)."),
+    advanced(`job-${job.id}`, "Réglages du projet",
+      h("div", { class: "row settings" },
+        h("label", {}, "Modèle du rendu final",
+          h("select", { onchange: patch("preset_final") },
+            finals.map((p) => h("option", { value: p.name, selected: p.name === job.preset_final }, p.label)))),
+        h("label", {}, "Fin du dernier plan", endModeSelect(job.end_mode, patch("end_mode")))),
+      h("p", { class: "muted small" },
+        job.keyframes.length < 2 ? "La fin du dernier plan ne compte que si tu ajoutes une image de fin. " : "",
+        job.end_mode === "guide"
+          ? "Indicative : le rendu final du dernier plan part de son image de départ seule et le prompt mène la " +
+            "fin ; l'image de fin sert seulement à juger l'aperçu. Les plans du milieu arrivent toujours sur leur image."
+          : "Exacte : le rendu final de chaque plan arrive exactement sur son image de fin (modèle 14B).")),
   ];
 }
 
@@ -391,10 +616,10 @@ function devLine(dev) {
     `${label} ${dev.before[kind]} → ${dev.after[kind]}`);
   return h("div", {
     class: "devs",
-    title: "Gap to the start image, in grey levels (0-255), before → after the match. Colour: distance between " +
-      "colour histograms, 0 when the colours are the same. Pixel: mean difference pixel by pixel, which also " +
-      "counts pose and framing.",
-  }, part("color", "colour"), " ", part("pixel", "pixel"));
+    title: "Écart avec l'image de départ, en niveaux de gris (0-255), avant → après l'ajustement. Couleurs : " +
+      "distance entre histogrammes, 0 quand les couleurs sont les mêmes. Pixels : différence moyenne pixel " +
+      "par pixel, qui compte aussi la pose et le cadrage.",
+  }, part("color", "écart couleurs"), " ", part("pixel", "pixels"));
 }
 
 function filePicker(onfile, label, cls = "") {
@@ -425,14 +650,18 @@ function dropZone(el, onfile) {
 function renderAddKeyframe(job) {
   const n = job.keyframes.length;
   const upload = (file) => uploadKeyframe(job, n, file, file.name);
-  return dropZone(h("div", { class: "kf add" },
+  return dropZone(h("div", { class: "kf add" + (n === 0 ? " first" : ""), dataset: { next: "add-kf" } },
     h("div", { class: "kf-drop" },
-      n === 0 ? "Drop the start image here" : `Drop keyframe ${n} here`,
+      h("strong", {}, n === 0 ? "Dépose l'image de départ ici" : n === 1 ? "Image de fin (facultatif)"
+        : `Image ${n} (facultatif)`),
       h("div", { class: "muted small" },
-        n === 0 ? "photo, watercolour, drawing; a cut-out (alpha) is flattened on the background colour"
-          : "or take one from a take's frames (below)"),
-      filePicker(upload, "Choose a file", "primary"))), upload);
+        n === 0 ? "photo, aquarelle, dessin ; une image détourée (transparence) est posée sur un fond uni"
+          : "le rendu final arrivera sur cette image. Tu peux aussi en prendre une dans une prise, plus bas " +
+            "(« Utiliser cette image »)."),
+      filePicker(upload, "Choisir un fichier", n === 0 ? "primary" : ""))), upload);
 }
+
+function kfName(k) { return k.position === 0 ? "image de départ" : `image ${k.position}`; }
 
 function renderKeyframe(job, k) {
   const isStart = k.position === 0;
@@ -440,75 +669,92 @@ function renderKeyframe(job, k) {
   const p = k.match_params || {};
   const bg = "#" + (p.background || [255, 255, 255]).map((c) => c.toString(16).padStart(2, "0")).join("");
   const replace = (file) => uploadKeyframe(job, k.position, file, file.name);
+  const title = isStart ? "Image de départ" : isLast ? `Image ${k.position} · fin` : `Image ${k.position}`;
   const card = h("div", { class: "kf" + (isStart ? " start" : "") },
-    h("div", { class: "kf-title" }, isStart ? "0 · start image" : `${k.position} · keyframe`,
-      !isStart && k.match_applied ? h("span", { class: "badge s-done" }, "matched") : null),
-    h("img", { src: kfUrl(k), alt: `keyframe ${k.position}`, onclick: () => openCompare(job, k) }),
-    isStart ? startControls(k, bg) : matchControls(k, bg),
-    devLine(k.deviation),
+    h("div", { class: "kf-title" }, title,
+      !isStart && k.match_applied ? h("span", { class: "badge s-done", title: "Ajustée sur l'image de départ" }, "ajustée") : null),
+    h("img", { src: kfUrl(k), alt: kfName(k), title: "Agrandir", onclick: () => openCompare(job, k) }),
+    isStart ? null : matchButtons(k, bg),
     h("div", { class: "row small-buttons" },
-      h("button", { type: "button", onclick: () => openCompare(job, k) }, isStart ? "View" : "Before / after"),
-      filePicker(replace, "Replace"),
+      h("button", { type: "button", onclick: () => openCompare(job, k) }, isStart ? "Agrandir" : "Avant / après"),
+      filePicker(replace, "Remplacer"),
       isLast
         ? h("button", { type: "button", class: "danger", onclick: () => {
-          if (confirm(`Remove keyframe ${k.position}?`)) act(() => api("DELETE", `/keyframes/${k.id}`));
-        } }, "Remove")
+          if (confirm(`Retirer l'${kfName(k)} ?`)) act(() => api("DELETE", `/keyframes/${k.id}`));
+        } }, "Retirer")
         : null),
+    isStart ? startAdvanced(k, bg) : matchAdvanced(k),
   );
   return dropZone(card, replace);
 }
 
-function startControls(k, bg) {
+function startAdvanced(k, bg) {
   const color = h("input", { type: "color", value: bg });
   const fringes = h("input", { type: "checkbox", checked: k.match_params?.remove_fringes !== false });
   const apply = () => act(() => api("POST", `/keyframes/${k.id}/match`,
     { background: color.value, remove_fringes: fringes.checked }));
-  return h("div", { class: "kf-controls" },
-    h("label", { class: "inline", title: "Colour a cut-out (alpha) is flattened on. Every keyframe follows it." },
-      "Background", color),
-    h("button", { type: "button", onclick: () => apply() }, "Apply"),
-    h("label", { class: "inline", title: "Choke the matte by 2 px to drop the old background's halo" },
-      fringes, "remove fringes"),
-  );
+  return advanced(`kf-${k.id}`,
+    h("div", { class: "kf-controls" },
+      h("label", { class: "inline" }, "Fond", color),
+      h("label", { class: "inline" }, fringes, "retirer les liserés"),
+      h("button", { type: "button", onclick: () => apply() }, "Appliquer")),
+    h("p", { class: "muted small" },
+      "Fond : couleur sur laquelle une image détourée est posée ; les autres images suivent. ",
+      "Liserés : rogne le détourage de 2 px pour enlever le halo de l'ancien fond."));
 }
 
-function matchControls(k, bg) {
-  const p = k.match_params || {};
-  const colorMatch = h("input", { type: "checkbox", checked: !k.match_applied || p.color_match !== false });
-  const fringes = h("input", { type: "checkbox", checked: p.remove_fringes !== false });
-  const run = (enabled) => act(() => api("POST", `/keyframes/${k.id}/match`,
-    { enabled, color_match: colorMatch.checked, remove_fringes: fringes.checked, background: bg }));
+// The match flags live in the « Avancé » block; the buttons read them from the card.
+function matchButtons(k, bg) {
+  const run = (enabled, ev) => {
+    const card = ev.target.closest(".kf");
+    act(() => api("POST", `/keyframes/${k.id}/match`, {
+      enabled, background: bg,
+      color_match: card.querySelector(".opt-colors").checked,
+      remove_fringes: card.querySelector(".opt-fringes").checked,
+    }));
+  };
   return h("div", { class: "kf-controls" },
-    h("button", { type: "button", class: k.match_applied ? "" : "primary", onclick: () => run(true),
-      title: "Same size and framing as the start image, same background, colours matched on it. " +
-        "Fixes colour, format and background, not identity." },
-    k.match_applied ? "Match again" : "Match to start"),
-    k.match_applied ? h("button", { type: "button", onclick: () => run(false) }, "Undo") : null,
-    h("label", { class: "inline" }, colorMatch, "colours"),
-    h("label", { class: "inline" }, fringes, "fringes"),
-  );
+    h("button", { type: "button", class: k.match_applied ? "" : "primary", onclick: (ev) => run(true, ev),
+      title: "Même taille, même cadrage, même fond et mêmes couleurs que l'image de départ. " +
+        "Corrige les couleurs et le format, pas l'identité (visage, âge)." },
+    k.match_applied ? "Réajuster" : "Ajuster sur le départ"),
+    k.match_applied ? h("button", { type: "button", onclick: (ev) => run(false, ev) }, "Annuler l'ajustement") : null,
+    k.match_applied ? null : h("div", { class: "muted small" }, "même format et mêmes couleurs que l'image de départ"));
+}
+
+function matchAdvanced(k) {
+  const p = k.match_params || {};
+  return advanced(`kf-${k.id}`,
+    h("div", { class: "kf-controls" },
+      h("label", { class: "inline" },
+        h("input", { type: "checkbox", class: "opt-colors", checked: !k.match_applied || p.color_match !== false }),
+        "ajuster les couleurs"),
+      h("label", { class: "inline" },
+        h("input", { type: "checkbox", class: "opt-fringes", checked: p.remove_fringes !== false }),
+        "retirer les liserés")),
+    devLine(k.deviation));
 }
 
 function openCompare(job, k) {
   const start = job.keyframes.find((x) => x.position === 0);
   const fig = (src, caption, cls = "") => h("figure", {}, h("img", { src, class: cls }), h("figcaption", {}, caption));
   const body = k.position === 0
-    ? [fig(k.orig_url, "Uploaded", "checker"), fig(kfUrl(k), "Prepared (sent to the model)")]
-    : [fig(kfUrl(start), "Start image (reference)"), fig(k.orig_url, "Before: uploaded", "checker"),
-      fig(kfUrl(k), k.match_applied ? "After: matched" : "Prepared (not matched)")];
+    ? [fig(k.orig_url, "Image déposée", "checker"), fig(kfUrl(k), "Préparée (envoyée au modèle)")]
+    : [fig(kfUrl(start), "Image de départ (référence)"), fig(k.orig_url, "Avant : image déposée", "checker"),
+      fig(kfUrl(k), k.match_applied ? "Après : ajustée" : "Préparée (pas ajustée)")];
   openModal(h("div", {},
-    h("h3", {}, k.position === 0 ? "Start image" : `Keyframe ${k.position}: before / after the match`),
+    h("h3", {}, k.position === 0 ? "Image de départ" : `Image ${k.position} : avant / après l'ajustement`),
     h("div", { class: "compare" }, body),
     devLine(k.deviation),
     k.position === 0 ? null : h("p", { class: "muted small" },
-      "The technical match fixes size, framing, background and colours. A keyframe taken from a preview keeps ",
-      "its drift in identity (face, age): the 14B reproduces it at the end of the segment.")));
+      "L'ajustement corrige la taille, le cadrage, le fond et les couleurs. Une image prise dans un aperçu garde ",
+      "sa dérive d'identité (visage, âge) : le modèle 14B la reproduit à la fin du plan.")));
 }
 
 function openModal(content) {
   const m = document.getElementById("modal");
   m.replaceChildren(h("div", { class: "modal-box" },
-    h("button", { type: "button", class: "close", onclick: closeModal }, "×"), content));
+    h("button", { type: "button", class: "close", title: "Fermer", onclick: closeModal }, "×"), content));
   m.hidden = false;
 }
 
@@ -528,16 +774,17 @@ function renderSegment(job, s) {
   const kout = s.kf_out === null ? null : job.keyframes.find((k) => k.position === s.kf_out);
   const prev = preset("preview");
   const fin = preset(job.preset_final);
-  const prompt = h("textarea", { class: "prompt", rows: 3, placeholder: "What moves, how; camera; style…" });
+  const prompt = h("textarea", { class: "prompt", rows: 3, dataset: { next: `prompt-${s.id}` },
+    placeholder: "Ce qui bouge et comment, la caméra, le style… ex. « les bateaux tanguent doucement, l'eau scintille, caméra fixe »" });
   const duration = h("input", { type: "number", class: "duration", min: 0.25, max: 10, step: 0.25 });
   const frames = h("span", { class: "muted small" });
-  const seed = h("input", { type: "number", class: "seed", placeholder: "random", min: 0 });
+  const seed = h("input", { type: "number", class: "seed", placeholder: "au hasard", min: 0 });
   prompt.value = s.prompt;
   duration.value = s.duration_s;
   const showFrames = () => {
     const d = Number(duration.value) || 0;
     frames.textContent = [prev, fin].filter(Boolean).map((p) =>
-      `${p.tier} ${framesFor(d, p.fps)} frames at ${p.fps} fps`).join(" · ");
+      `${TIER_LABELS[p.tier]} : ${framesFor(d, p.fps)} images à ${p.fps} images/s`).join(" · ");
   };
   showFrames();
   const save = async () => {
@@ -561,33 +808,44 @@ function renderSegment(job, s) {
   const flf = s.kf_out !== null && s.end_mode === "exact";
   const thumb = (k, label) => k
     ? h("figure", { class: "seg-kf" }, h("img", { src: kfUrl(k) }), h("figcaption", {}, label))
-    : h("figure", { class: "seg-kf empty" }, h("div", {}, "no end image"), h("figcaption", {}, label));
+    : h("figure", { class: "seg-kf empty" }, h("div", {}, label === "début" ? "pas encore d'image" : "pas d'image de fin"),
+      h("figcaption", {}, label));
+  const multi = job.segments.length > 1;
+  const kinName = kin ? kfName(kin) : "image de départ";
   return h("div", { class: "card segment" },
     h("div", { class: "seg-head" },
-      h("h3", {}, `Segment ${s.idx + 1}`),
+      h("h3", {}, multi ? `Plan ${s.idx + 1}` : "Plan"),
       h("span", { class: "muted" },
-        s.kf_out === null ? "start image only"
-          : `keyframe ${s.kf_in} → ${s.kf_out}` + (s.end_mode === "guide" ? " (guide: final starts from the start alone)" : ""))),
+        s.kf_out === null ? `part de l'${kinName}, le prompt mène la suite`
+          : s.end_mode === "guide" ? `de l'${kinName} vers l'image ${s.kf_out} (fin indicative)`
+            : `de l'${kinName} à l'image ${s.kf_out}`)),
     h("div", { class: "seg-body" },
       h("div", { class: "seg-kfs" },
-        thumb(kin, `start · ${s.kf_in}`),
-        thumb(kout, s.kf_out === null ? "end" : s.end_mode === "guide" ? `guide · ${s.kf_out}` : `end · ${s.kf_out}`)),
+        thumb(kin, "début"),
+        thumb(kout, s.kf_out === null ? "fin libre" : s.end_mode === "guide" ? "fin indicative" : "fin")),
       h("div", { class: "seg-form" },
-        h("label", {}, "Prompt", prompt),
+        h("label", {}, "Que se passe-t-il ? (prompt)", prompt),
         h("div", { class: "row" },
-          h("label", { class: "inline" }, "Duration (s)", duration), frames),
-        h("div", { class: "row" },
-          h("label", { class: "inline", title: "Empty: a new random seed per take. Every take stores its seed." },
-            "Seed", seed),
-          h("button", { type: "button", onclick: () => launch("preview"),
-            title: prev ? `${prev.label}. ~${fmtDuration(estimate(prev))}` : "" }, "Preview"),
-          h("button", { type: "button", class: "primary", onclick: () => launch("final"),
-            title: fin ? `${fin.label}. ~${fmtDuration(estimate(fin))}` : "" }, "Final render")),
+          h("label", { class: "inline" }, "Durée (s)", duration),
+          h("span", { class: "spacer" }),
+          h("button", { type: "button", dataset: { next: `preview-${s.id}` }, onclick: () => launch("preview"),
+            title: prev ? prev.label : "" }, `Aperçu ${prev ? `(${fmtMinutes(estimate(prev))})` : ""}`),
+          h("button", { type: "button", class: "primary", dataset: { next: `final-${s.id}` },
+            onclick: () => launch("final"), title: fin ? fin.label : "" },
+          `Rendu final ${fin ? `(${fmtMinutes(estimate(fin))})` : ""}`)),
         h("p", { class: "muted small" },
-          "The preview (FastWan 5B, a few minutes) always starts from the start image alone: it checks the " +
-          "prompt and the motion" + (flf ? ", not the ending the 14B will reach." : "."),
+          "L'aperçu (modèle rapide) sert à vérifier le prompt et le mouvement ; il part toujours de l'image de " +
+          "départ seule" + (flf ? ", donc il ne montre pas la fin que le rendu final atteindra." : ".") +
+          " Le rendu final est la version de qualité : lance-le quand l'aperçu te convient.",
           s.kf_out !== null && s.end_mode === "guide"
-            ? " Compare its last frame with the guide keyframe." : ""))),
+            ? " Compare la dernière image de l'aperçu avec l'image de fin indicative." : ""),
+        advanced(`seg-${s.id}`,
+          h("div", { class: "row" },
+            h("label", { class: "inline", title: "Vide : un tirage au hasard à chaque prise. Chaque prise garde le sien." },
+              "Graine (seed)", seed),
+            frames)))),
+    h("h4", { class: "takes-title" }, "Prises", h("span", { class: "muted small" },
+      " · chaque rendu lancé donne une prise ; coche « Garder pour le montage » sur celle qui te plaît")),
     h("div", { class: "takes" }),
   );
 }
@@ -609,12 +867,14 @@ function updateSegment(job, s) {
   const box = card.querySelector(".takes");
   syncList(box, takes, (t) => t.id, (t) => {
     const q = queueItem("take", t.id);
-    const live = t.status === "running" || t.status === "queued";
+    const live = isLive(t);
     return JSON.stringify([t.status, t.phase, t.step, t.progress, t.preview_url, t.error, t.output_url,
       s.retained_take_id === t.id, job.keyframes.length, live ? [q?.starts_in_s, Math.round(q?.remaining_s / 5)] : 0,
       live ? t.log_tail.slice(-1) : 0]);
   }, (t) => renderTake(job, s, t));
-  if (!takes.length) box.replaceChildren(h("p", { class: "muted small" }, "No take yet."));
+  if (!takes.length) {
+    box.replaceChildren(h("p", { class: "muted small" }, "Pas encore de prise : lance un aperçu."));
+  }
 }
 
 // --- takes --------------------------------------------------------------------------------------
@@ -624,27 +884,30 @@ function renderTake(job, s, t) {
   const retained = s.retained_take_id === t.id;
   const set = t.settings || {};
   const head = h("div", { class: "take-head" },
-    h("strong", {}, `#${t.id}`), " ", h("span", { class: `tier ${t.tier}` }, t.tier), " ", badge(t.status),
-    retained ? h("span", { class: "badge retained" }, "retained") : null,
-    h("span", { class: "muted small" },
-      ` ${t.preset} · seed ${t.seed} · ${set.video_length} frames · ${set.resolution} · ` +
-      `${set.image_prompt_type === "SE" ? "start + end" : "start only"}`),
+    h("strong", {}, `Prise #${t.id}`), " ", h("span", { class: `tier ${t.tier}` }, TIER_LABELS[t.tier] || t.tier),
+    " ", badge(t.status),
+    retained ? h("span", { class: "badge retained" }, "gardée pour le montage") : null,
+    h("span", { class: "muted small", title: t.preset },
+      ` graine ${t.seed} · ${set.video_length} images · ${set.resolution} · ` +
+      `${set.image_prompt_type === "SE" ? "début + fin" : "début seul"}`),
     h("span", { class: "spacer" }),
-    t.status === "done" ? h("label", { class: "inline", title: "The take used for this segment in the assembly" },
-      h("input", { type: "radio", name: `retain-${s.id}`, checked: retained,
-        onchange: () => act(() => api("PUT", `/segments/${s.id}/retained`, { take_id: t.id })) }), "retain") : null,
+    t.status === "done" ? h("label", { class: "inline retain", dataset: { next: `retain-${t.id}` },
+      title: "La prise utilisée pour ce plan dans le montage (une par plan)" },
+    h("input", { type: "radio", name: `retain-${s.id}`, checked: retained,
+      onchange: () => act(() => api("PUT", `/segments/${s.id}/retained`, { take_id: t.id })) }),
+    "Garder pour le montage") : null,
     retained ? h("button", { type: "button", class: "link",
-      onclick: () => act(() => api("PUT", `/segments/${s.id}/retained`, { take_id: null })) }, "unretain") : null,
-    ["queued", "running"].includes(t.status)
+      onclick: () => act(() => api("PUT", `/segments/${s.id}/retained`, { take_id: null })) }, "ne plus garder") : null,
+    isLive(t)
       ? h("button", { type: "button", class: "danger", onclick: () => act(() => api("POST", `/takes/${t.id}/cancel`)) },
-        t.cancel_requested ? "cancelling…" : "Cancel")
-      : h("button", { type: "button", title: "A new take with exactly these settings, seed included",
-        onclick: () => act(() => api("POST", `/takes/${t.id}/replay`)) }, "Replay"),
+        t.cancel_requested ? "annulation…" : "Annuler")
+      : h("button", { type: "button", title: "Une nouvelle prise avec exactement les mêmes réglages, graine comprise",
+        onclick: () => act(() => api("POST", `/takes/${t.id}/replay`)) }, "Refaire à l'identique"),
   );
   const body = [];
   if (t.status === "queued") {
-    body.push(h("p", { class: "muted" }, q ? `Starts in about ${fmtDuration(q.starts_in_s)}, ` +
-      `takes about ${fmtDuration(q.remaining_s)}.` : "Queued."));
+    body.push(h("p", { class: "muted" }, q ? `En file : commence dans ${fmtDuration(q.starts_in_s)} environ, ` +
+      `dure ${fmtDuration(q.remaining_s)}.` : "En file."));
   } else if (t.status === "running") {
     body.push(renderProgress(t, q));
   } else if (t.status === "done" && t.output_url) {
@@ -653,30 +916,31 @@ function renderTake(job, s, t) {
     const d = t.durations;
     if (d) {
       const ph = Object.entries(d.phases || {}).map(([k, v]) => `${PHASE_LABELS[k] || k} ${fmtDuration(v)}`).join(" · ");
-      body.push(h("p", { class: "muted small" }, `Rendered in ${fmtDuration(d.total)} (${ph}), finished ${fmtDate(t.finished_at)}.`));
+      body.push(h("p", { class: "muted small" }, `Rendue en ${fmtDuration(d.total)} (${ph}), le ${fmtDate(t.finished_at)}.`));
     }
   } else if (t.status === "failed") {
-    body.push(h("pre", { class: "error" }, t.error || "failed"));
+    body.push(h("pre", { class: "error" }, t.error || "échec"));
   }
   if (t.log_tail.length && t.status !== "done") {
-    body.push(h("details", {}, h("summary", {}, "Log"), h("pre", { class: "log" }, t.log_tail.join("\n"))));
+    body.push(fold(`log-${t.id}`, "", "Journal", h("pre", { class: "log" }, t.log_tail.join("\n"))));
   }
-  return h("div", { class: `take ${t.status}${retained ? " is-retained" : ""}` }, head, body);
+  return h("div", { class: `take ${t.status}${retained ? " is-retained" : ""}`, dataset: { next: `take-${t.id}` } },
+    head, body);
 }
 
 function renderProgress(t, q) {
-  const label = PHASE_LABELS[t.phase] || t.phase || "starting";
-  const steps = t.phase === "inference" && t.total_steps ? ` · step ${t.step || 0}/${t.total_steps}` : "";
+  const label = PHASE_LABELS[t.phase] || t.phase || "démarrage";
+  const steps = t.phase === "inference" && t.total_steps ? ` · étape ${t.step || 0}/${t.total_steps}` : "";
   const pct = t.phase === "inference" && t.total_steps ? Math.round(100 * (t.step || 0) / t.total_steps)
     : (t.progress ?? 0);
   return h("div", { class: "progress-box" },
     t.preview_url ? h("img", { class: "live-preview", src: `${t.preview_url}?t=${Date.now()}`,
-      title: "Latest denoising preview from Wan2GP" }) : null,
+      title: "Dernier état de la génération" }) : null,
     h("div", { class: "progress-text" },
       h("div", {}, h("strong", {}, label), steps),
       h("div", { class: "bar" }, h("div", { style: `width:${Math.max(2, Math.min(100, pct))}%` })),
-      h("div", { class: "muted" }, q ? `about ${fmtDuration(q.remaining_s)} left` : "",
-        t.started_at ? ` · running for ${fmtDuration(Date.now() / 1000 - t.started_at)}` : ""),
+      h("div", { class: "muted" }, q ? `encore ${fmtDuration(q.remaining_s)} environ` : "",
+        t.started_at ? ` · commencée il y a ${fmtDuration(Date.now() / 1000 - t.started_at)}` : ""),
       t.log_tail.length ? h("div", { class: "muted small mono" }, t.log_tail[t.log_tail.length - 1]) : null));
 }
 
@@ -684,14 +948,16 @@ function renderProgress(t, q) {
 
 function frameTool(job, url, fps, endKeyframe) {
   const video = h("video", { src: url, controls: true, preload: "auto", muted: true, playsInline: true });
-  const counter = h("span", { class: "mono small" }, "frame –");
+  const counter = h("span", { class: "mono small" }, "image –");
   const target = h("select", {});
   const n = job.keyframes.length;
-  target.append(h("option", { value: n }, `as new keyframe ${n}`));
-  for (let i = n - 1; i >= 0; i--) target.append(h("option", { value: i }, `replacing keyframe ${i}${i === 0 ? " (start)" : ""}`));
+  target.append(h("option", { value: n }, n === 1 ? "comme image de fin" : `comme nouvelle image ${n}`));
+  for (let i = n - 1; i >= 0; i--) {
+    target.append(h("option", { value: i }, i === 0 ? "à la place de l'image de départ" : `à la place de l'image ${i}`));
+  }
   const total = () => Math.max(1, Math.round(video.duration * fps));
   const current = () => Math.min(total() - 1, Math.floor(video.currentTime * fps + 1e-3));
-  const show = () => { counter.textContent = isFinite(video.duration) ? `frame ${current()} / ${total() - 1}` : "frame –"; };
+  const show = () => { counter.textContent = isFinite(video.duration) ? `image ${current()} / ${total() - 1}` : "image –"; };
   video.addEventListener("timeupdate", show);
   video.addEventListener("seeked", show);
   video.addEventListener("loadedmetadata", show);
@@ -719,10 +985,11 @@ function frameTool(job, url, fps, endKeyframe) {
   const send = async () => {
     const pos = Number(target.value);
     const i = current();
-    if (pos < n && !confirm(`Replace keyframe ${pos} with frame ${i}? Takes already made keep their own copy.`)) return;
+    const name = pos === 0 ? "l'image de départ" : `l'image ${pos}`;
+    if (pos < n && !confirm(`Remplacer ${name} par l'image ${i} de cette vidéo ? Les prises déjà faites gardent leur copie.`)) return;
     const blob = await grab();
     await uploadKeyframe(job, pos, blob, `frame-${i}.png`);
-    toast(`Frame ${i} is now keyframe ${pos}.`, false);
+    toast(`L'image ${i} est maintenant ${name}.`, false);
   };
   const save = async () => {
     const blob = await grab();
@@ -733,17 +1000,18 @@ function frameTool(job, url, fps, endKeyframe) {
   const tool = h("div", { class: "frame-tool" },
     h("div", { class: "frame-videos" }, video,
       endKeyframe ? h("figure", { class: "end-ref" }, h("img", { src: kfUrl(endKeyframe) }),
-        h("figcaption", {}, `keyframe ${endKeyframe.position} (end)`)) : null),
+        h("figcaption", {}, `image de fin (${endKeyframe.position}), pour comparer`)) : null),
     h("div", { class: "row frame-controls" },
-      h("button", { type: "button", title: "First frame", onclick: () => seek(0) }, "⏮"),
-      h("button", { type: "button", title: "Previous frame (←)", onclick: () => seek(current() - 1) }, "◀"),
+      h("button", { type: "button", title: "Première image", onclick: () => seek(0) }, "⏮"),
+      h("button", { type: "button", title: "Image précédente (←)", onclick: () => seek(current() - 1) }, "◀"),
       counter,
-      h("button", { type: "button", title: "Next frame (→)", onclick: () => seek(current() + 1) }, "▶"),
-      h("button", { type: "button", title: "Last frame", onclick: () => seek(total() - 1) }, "⏭"),
+      h("button", { type: "button", title: "Image suivante (→)", onclick: () => seek(current() + 1) }, "▶"),
+      h("button", { type: "button", title: "Dernière image", onclick: () => seek(total() - 1) }, "⏭"),
       h("span", { class: "spacer" }),
-      h("span", { class: "small" }, "Use this frame"), target,
-      h("button", { type: "button", onclick: send }, "Send"),
-      h("button", { type: "button", onclick: save, title: "Download this frame as PNG" }, "PNG")),
+      h("span", { class: "small", title: "Par exemple la dernière image d'un aperçu comme image de fin : le rendu " +
+        "final arrivera dessus." }, "Utiliser cette image"), target,
+      h("button", { type: "button", onclick: send }, "Envoyer"),
+      h("button", { type: "button", onclick: save, title: "Télécharger cette image en PNG" }, "PNG")),
   );
   video.addEventListener("keydown", (ev) => {
     if (ev.key === "ArrowLeft") { ev.preventDefault(); seek(current() - 1); }
@@ -756,38 +1024,48 @@ function frameTool(job, url, fps, endKeyframe) {
 
 function renderAssembly(job) {
   const missing = job.segments.filter((s) => !s.retained_take_id).map((s) => s.idx + 1);
+  const multi = job.segments.length > 1;
   const cm = h("input", { type: "checkbox", checked: true });
   const fps = h("select", {},
-    h("option", { value: "native" }, "native fps"),
-    h("option", { value: "x2" }, "x2 (RIFE interpolation)"));
-  const form = h("div", { class: "card row" },
-    h("label", { class: "inline", title: "Match each segment's colours on the first one, against drift between segments" },
-      cm, "colour match"),
-    h("label", { class: "inline" }, "Frame rate", fps),
-    h("button", { type: "button", class: "primary", disabled: !job.segments.length || missing.length > 0,
-      onclick: () => act(() => api("POST", `/jobs/${job.id}/assemblies`, { color_match: cm.checked, fps_mode: fps.value })) },
-    "Assemble"),
-    missing.length ? h("span", { class: "muted" }, `Retain a take for segment ${missing.join(", ")} first.`)
-      : h("span", { class: "muted" }, `Takes ${job.segments.map((s) => "#" + s.retained_take_id).join(", ")}.`));
+    h("option", { value: "native" }, "normale"),
+    h("option", { value: "x2" }, "x2, plus fluide (interpolation RIFE)"));
+  const form = h("div", { class: "card" },
+    h("div", { class: "row" },
+      h("button", { type: "button", class: "primary", dataset: { next: "assemble" },
+        disabled: !job.segments.length || missing.length > 0,
+        onclick: () => act(() => api("POST", `/jobs/${job.id}/assemblies`, { color_match: cm.checked, fps_mode: fps.value })) },
+      "Monter la vidéo"),
+      missing.length
+        ? h("span", { class: "muted" }, multi
+          ? `D'abord, garde une prise pour le plan ${missing.join(", ")} (« Garder pour le montage »).`
+          : "D'abord, garde une prise (« Garder pour le montage »).")
+        : h("span", { class: "muted" }, `Prises gardées : ${job.segments.map((s) => "#" + s.retained_take_id).join(", ")}.`)),
+    advanced(`asm-${job.id}`,
+      h("div", { class: "row" },
+        h("label", { class: "inline", title: "Ajuste les couleurs de chaque plan sur le premier, contre la dérive entre plans" },
+          cm, "raccord des couleurs entre plans"),
+        h("label", { class: "inline" }, "Fluidité", fps))));
   const list = [...job.assemblies].reverse().map((a) => {
     const q = queueItem("assembly", a.id);
     const fpsOf = a.fps_mode === "x2" ? 2 : 1;
     const first = job.segments[0]?.takes.find((t) => t.id === a.take_ids[0]);
-    return h("div", { class: `take ${a.status}` },
+    return h("div", { class: `take ${a.status}`, dataset: { next: `asm-${a.id}` } },
       h("div", { class: "take-head" },
-        h("strong", {}, `assembly ${a.id}`), " ", badge(a.status),
+        h("strong", {}, `Montage ${a.id}`), " ", badge(a.status),
         h("span", { class: "muted small" },
-          ` takes ${a.take_ids.map((i) => "#" + i).join(", ")} · ${a.fps_mode} · colour match ${a.color_match ? "on" : "off"}`),
+          ` prises ${a.take_ids.map((i) => "#" + i).join(", ")} · ${a.fps_mode === "x2" ? "fluidité x2" : "fluidité normale"}` +
+          ` · raccord des couleurs ${a.color_match ? "oui" : "non"}`),
         h("span", { class: "spacer" }),
-        ["queued", "running"].includes(a.status)
+        isLive(a)
           ? h("button", { type: "button", class: "danger",
-            onclick: () => act(() => api("POST", `/assemblies/${a.id}/cancel`)) }, "Cancel") : null),
-      a.status === "running" ? h("p", {}, a.phase || "starting", q ? ` · about ${fmtDuration(q.remaining_s)} left` : "") : null,
-      a.status === "queued" && q ? h("p", { class: "muted" }, `Starts in about ${fmtDuration(q.starts_in_s)}.`) : null,
+            onclick: () => act(() => api("POST", `/assemblies/${a.id}/cancel`)) }, "Annuler") : null),
+      a.status === "running" ? h("p", {}, a.phase || "démarrage", q ? ` · encore ${fmtDuration(q.remaining_s)} environ` : "") : null,
+      a.status === "queued" && q ? h("p", { class: "muted" }, `Commence dans ${fmtDuration(q.starts_in_s)} environ.`) : null,
       a.status === "failed" ? h("pre", { class: "error" }, a.error) : null,
       a.status === "done" && a.url
         ? [frameTool(job, a.url, (first?.fps || 16) * fpsOf, null),
-          h("p", { class: "small" }, h("a", { href: a.url, download: `zoetrope-job${job.id}-assembly${a.id}.mp4` }, "Download"))]
+          h("p", {}, h("a", { class: "button primary", href: a.url, dataset: { next: `download-${a.id}` },
+            download: `zoetrope-projet${job.id}-montage${a.id}.mp4` }, "Télécharger la vidéo"))]
         : null);
   });
   return [form, list];
