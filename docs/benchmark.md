@@ -248,6 +248,84 @@ RGBA cut-out as start image, prepared by the backend: alpha flattened on white, 
 - Assembly of that take at x2 (RIFE through the worker, colour match on): 11 s, 81 frames at
   32 fps.
 
+## Identity match of a keyframe: Flux 2 Klein 4B
+
+An end keyframe taken from a FastWan preview carries its drift (narrower, older face, added
+shirt), and the 14B reproduces it faithfully (sections above). Can an image editing model give
+the keyframe back the start image's identity? One model, one subject, 2026-11-12.
+
+| Item        | Value                                                                        |
+| ----------- | ---------------------------------------------------------------------------- |
+| Model       | `flux2_klein_4b`: FLUX.2 Klein 4B, steps and CFG distilled, transformer int8 (quanto) |
+| Download    | 8.8 GB in three files: transformer 4.07 GB, Qwen3 4B text encoder int8 4.41 GB, VAE 0.34 GB |
+| Settings    | 4 steps, embedded guidance 1, seed 42, reference images (`image_refs`, `video_prompt_type` `KI`), Wan2GP's image profile (4) |
+| Inputs      | the P3 start portrait (480x510) and the P3 FastWan end keyframe               |
+
+Chosen over the alternatives for its size: Flux 1 Kontext int8 is 12 GB, Qwen Image Edit 2511
+int8 20.5 GB, Krea 2 Turbo (with its "Identity Edit" LoRA, made for this) 13.5 GB plus a Qwen3-VL
+encoder. Scripts, images and logs: `outputs/p8/` (not tracked).
+
+| Run                                | 480x512        | 960x1024        |
+| ---------------------------------- | -------------- | --------------- |
+| Denoising, 4 steps                 | 20-28 s        | ~2 min          |
+| Whole task (prompt encoded, decode)| 35-41 s        | 1 min 48 s-3 min|
+
+- **It runs on Pascal** with no setup: no NaN, no black image. Load: a few seconds with the
+  files in the OS cache. **VRAM peak 3.2 GB, RAM peak 19.1 GB** (+9 GB): it fits next to nothing
+  else heavy, and loading it unloads the video model in the same session.
+- Three ways to ask, all at seed 42:
+  - **A, fix the keyframe**: image 1 the FastWan keyframe, image 2 the start, "give the man in
+    image 1 the face of the man in image 2, keep the pose…". Partial at 512 (rounder nose, wider
+    face, younger skin, but the keyframe's oval and shirt stay); at 1024 the keyframe barely
+    changes.
+  - **B, re-pose the start after the keyframe**: image 1 the start, image 2 the keyframe as
+    expression target. Klein copies image 2 almost unchanged, at both sizes: the keyframe
+    wins.
+  - **C, edit the start with a text instruction only**: the start image alone, "make the man
+    close his eyes, smile widely and lower his head slightly; keep his face, beard, hair,
+    framing, lighting and white background". **Same face, same framing, same background**;
+    eyes closed and a wide smile as asked. The head does not lower; the image is slightly washed
+    out; the cut-out's fringes stay (they are in the start image).
+- **1024 brings nothing** over 512 for a 480x510 keyframe, at 3 to 4 times the cost.
+- After the backend's technical match (fit, histogram match), pixel deviation from the start
+  image: **5.8 for the Klein C keyframe against 16.3 for the FastWan keyframe** (colour 0.3
+  and 0.4).
+
+### Through the 14B: FLF to the Klein keyframe
+
+Same render as P5's profile 5 FLF (start, prompt, seed 42, 41 frames at 16 fps, 4 steps), the end
+keyframe replaced by the Klein C one after the technical match.
+
+| Run                              | Steps (s)          | Total       | VRAM peak | RAM peak  |
+| -------------------------------- | ------------------ | ----------- | --------- | --------- |
+| FLF to FastWan keyframe (P5)     | 316, 219, 383, 226 | 22 min 10 s | 4.9 GB    | 32.5 GB   |
+| **FLF to Klein keyframe**        | 321, 213, …        | **19 min 52 s** (one 14B load included) | 5.3 GB | 32.6 GB |
+
+Mean difference to the start image (grey levels), frames 0 / 10 / 20 / 30 / 40:
+
+| End keyframe | 0   | 10   | 20   | 30   | 40   | frame 40 to end keyframe |
+| ------------ | --- | ---- | ---- | ---- | ---- | ------------------------ |
+| FastWan (P5) | 1.7 | 37.2 | 36.0 | 34.6 | 26.0 | 7.6                      |
+| **Klein C**  | 1.7 | 26.3 | 23.7 | 24.4 | 11.2 | 6.9                      |
+
+- **The identity no longer slides.** With the FastWan keyframe the face turns into another man's
+  from frame 10 (narrower, older, shirt and tie). With the Klein keyframe it is the start
+  portrait's face throughout, and frame 40 lands on the eyes-closed smile.
+- **Still there**: the expression overshoots mid-clip (a wide laughing grin, as in P3); the
+  background drifts to grey less (corner level 248 / 244 / 241 / 238 / 238 / 244 at frames 0 / 1 /
+  5 / 10 / 20 / 40, against 248 / 243 / 234 / 232 / 233 / 237); **new: a few yellow paint-like
+  blobs** on the background around frames 10-20, likely from the coloured fringes of the cut-out,
+  which the Klein keyframe keeps at both ends.
+
+### Verdict
+
+**Flux 2 Klein 4B is fit for the identity match**, as "edit the start image with a text
+instruction" (C), not as "fix a drifted keyframe" (A) or "copy a keyframe's pose" (B): the
+keyframe comes from the start image, so its identity, framing and background are the start's by
+construction. Cost: ~40 s per keyframe at 512 plus a model switch in the worker. Limits seen: the
+pose follows the text loosely (no head lowering), and anything wrong in the start image (fringes)
+is kept. One subject, one seed: not measured on a drawing or a watercolour.
+
 ## Recommendation
 
 **5B for previews.** It fits comfortably (5.7 GB VRAM, 24 GB RAM). FastWan (3 steps): 4 min
@@ -261,6 +339,10 @@ as int8/fp8 checkpoints, which its offloading handles with the 32 GB of RAM.
 *Wan 2.2 I2V Enhanced Lightning v2 14B* (4 steps, no CFG) is now measured (section above):
 27 min 36 s per 2.56 s segment, RAM saturated; 22 min 10 s with profile 5 (section above).
 The backend uses it for every final render, queued (preset `final-14b`).
+
+**Flux 2 Klein 4B for keyframes**: an end keyframe made by editing the start image with a text
+instruction (~40 s at 512) keeps the start's identity through the 14B FLF, where a FastWan frame
+pulls it away (section above). Not wired into the backend yet.
 
 **ComfyUI: not yet.** Wan2GP already provides everything the brief expects from ComfyUI:
 headless runs (`wgp.py --process settings.json`), a Python API (`WanGPSession`) and an MCP
