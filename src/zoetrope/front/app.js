@@ -7,7 +7,8 @@
 //
 // The job page follows the user's path in five steps (STEPS): start image, preview, final render,
 // keep a take, assembly. nextStep() reads the job's state and says what to do now; the button that
-// does it is outlined (data-next / .is-next).
+// does it is outlined (data-next / .is-next). The page opens on the storyboard (image → shot →
+// image…, P19b) and unfolds one shot at a time; reveal() unfolds whatever hides a target.
 //
 // Every prompt field (a shot's motion, an image to create) lists the rule findings as the user
 // types and offers an AI review that proposes a corrected version (P12, « prompt review » below).
@@ -155,7 +156,8 @@ const TIER_LABELS = { preview: "aperçu", final: "rendu final", keyframe: "image
 const openFolds = new Set();
 
 function fold(key, cls, label, ...children) {
-  const d = h("details", { class: cls, open: openFolds.has(key) }, h("summary", {}, label), ...children);
+  const d = h("details", { class: cls, open: openFolds.has(key), dataset: { fold: key } },
+    h("summary", {}, label), ...children);
   d.addEventListener("toggle", () => {
     if (!d.open) { openFolds.delete(key); return; }
     if (openFolds.has(key)) return; // reopened by a rebuild: restoreLogScrolls placed it
@@ -163,6 +165,24 @@ function fold(key, cls, label, ...children) {
     for (const pre of d.querySelectorAll("pre.log")) pre.scrollTop = pre.scrollHeight; // newest lines
   });
   return d;
+}
+
+function openFold(key) {
+  openFolds.add(key);
+  for (const d of document.querySelectorAll(`details[data-fold="${key}"]`)) d.open = true;
+}
+
+// A help text: one line, and a « ? » that unfolds the rest (`more`, optional). Its state survives
+// rebuilds like a fold's.
+function helpLine(key, short, ...more) {
+  const k = `help-${key}`;
+  const extra = more.length ? h("span", { class: "help-more", hidden: !openFolds.has(k) }, " ", ...more) : null;
+  const toggle = more.length ? h("button", { type: "button", class: "help-toggle", title: "En savoir plus",
+    onclick: () => {
+      extra.hidden = !extra.hidden;
+      if (extra.hidden) openFolds.delete(k); else openFolds.add(k);
+    } }, "?") : null;
+  return h("p", { class: "muted help" }, short, " ", toggle, extra);
 }
 
 // « Avancé » block; the first child may be a string that replaces that label.
@@ -355,15 +375,18 @@ function renderTopbar(error) {
   renderQueuePanel();
 }
 
-document.getElementById("queue-toggle").addEventListener("click", (ev) => {
-  ev.stopPropagation();
+document.getElementById("queue-toggle").addEventListener("click", () => {
   const p = document.getElementById("queue-panel");
   p.hidden = !p.hidden;
 });
-document.addEventListener("click", (ev) => { // a click outside closes the panel
+// A click outside closes the panel. In the capture phase, so a button that stops its click (the
+// « ⋯ » of a project card) closes it too.
+document.addEventListener("click", (ev) => {
   const p = document.getElementById("queue-panel");
-  if (!p.hidden && !p.contains(ev.target)) p.hidden = true;
-});
+  if (!p.hidden && !p.contains(ev.target) && !document.getElementById("queue-toggle").contains(ev.target)) {
+    p.hidden = true;
+  }
+}, true);
 
 function taskThumb(i) {
   return i.thumb_url ? h("img", { class: "task-thumb", src: i.thumb_url, alt: "" }) : h("span", { class: "task-thumb" });
@@ -680,12 +703,113 @@ function scrollToId(id) {
   document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-function goTo(target) {
+// Scroll to the element of a target (data-next), after unfolding what hides it; `flash` marks it
+// for a moment (a link from the queue panel), else its first field gets the focus.
+function goTo(target, { flash = false } = {}) {
+  reveal(state.job, target);
   const el = document.querySelector(`[data-next="${target}"]`);
   if (!el) return;
   el.scrollIntoView({ behavior: "smooth", block: "center" });
+  if (flash) {
+    el.classList.add("flash");
+    setTimeout(() => el.classList.remove("flash"), 2000);
+    return;
+  }
   const focusable = el.matches("textarea, input, button") ? el : el.querySelector("textarea, input, button");
   if (focusable) setTimeout(() => focusable.focus({ preventScroll: true }), 400);
+}
+
+// --- what the job page shows: one shot, one image panel ----------------------------------------
+//
+// The job page unfolds one shot at a time, chosen in the storyboard (the film's strip, at the top);
+// the other shots' cards stay in the page, hidden, so a video or a prompt being typed survives.
+// A click on an image of the strip opens its panel (replace, adjust, copy, remove). Per job, kept
+// across polls and route changes.
+
+const views = new Map(); // job id -> { seg: segment id, kf: position of the open image, keygen: bool }
+
+function viewOf(job) {
+  let v = views.get(job.id);
+  if (!v) {
+    v = { seg: null, kf: null, keygen: null };
+    views.set(job.id, v);
+  }
+  return v;
+}
+
+// The segment a target of nextStep() or of a link points into, or null.
+function segOfTarget(job, target) {
+  let m = /^(?:preview|final|prompt)-(\d+)$/.exec(target || "");
+  if (m) return job.segments.some((s) => s.id === Number(m[1])) ? Number(m[1]) : null;
+  m = /^(?:take|retain)-(\d+)$/.exec(target || "");
+  if (m) return job.segments.find((s) => s.takes.some((t) => t.id === Number(m[1])))?.id ?? null;
+  return null;
+}
+
+// The unfolded shot: the one chosen, else the one the next step is about, else the first without
+// a retained take.
+function currentSeg(job) {
+  const v = viewOf(job);
+  if (!job.segments.some((s) => s.id === v.seg)) {
+    v.seg = segOfTarget(job, nextStep(job).target) ?? job.segments.find((s) => !s.retained_take_id)?.id ??
+      job.segments[0]?.id ?? null;
+  }
+  return v.seg;
+}
+
+function keygenOpen(job) {
+  const v = viewOf(job);
+  return v.keygen ?? job.keyframes.length === 0;
+}
+
+// The takes shown in a shot: the retained one, the latest and the running ones; the others are
+// folded in « N autres prises ».
+function shownTakeIds(s) {
+  return new Set([s.retained_take_id, s.takes.at(-1)?.id, ...s.takes.filter(isLive).map((t) => t.id)]);
+}
+
+// Unfold what hides the element of `target`: its shot, the older takes, the history of created images.
+function reveal(job, target) {
+  if (!job || !target) return;
+  const v = viewOf(job);
+  const segId = segOfTarget(job, target);
+  if (segId !== null) {
+    v.seg = segId;
+    const m = /^(?:take|retain)-(\d+)$/.exec(target);
+    const s = job.segments.find((x) => x.id === segId);
+    if (m && !shownTakeIds(s).has(Number(m[1]))) openFold(`older-${segId}`);
+  }
+  const g = /^keygen-(\d+)$/.exec(target);
+  if (g && !isLive(job.keygens.find((x) => x.id === Number(g[1])) || { status: "done" })) openFold(`keygens-${job.id}`);
+  if (target === "keygen") v.keygen = true;
+  renderJob();
+}
+
+function selectSeg(job, id) {
+  const v = viewOf(job);
+  v.seg = id;
+  v.kf = null;
+  renderJob();
+  scrollToId("step-shots");
+}
+
+function toggleKf(job, position) {
+  const v = viewOf(job);
+  v.kf = v.kf === position ? null : position;
+  renderJob();
+}
+
+function openKeygen(job, target) {
+  const v = viewOf(job);
+  v.keygen = true;
+  if (target !== undefined) {
+    keygenDraft(job).target = target;
+    delete document.querySelector(".keygen-form").dataset.sig; // rebuild it with that target
+  }
+  renderJob();
+  const field = document.querySelector(".keygen-form textarea.prompt");
+  field?.scrollIntoView({ behavior: "smooth", block: "center" });
+  setTimeout(() => field?.focus({ preventScroll: true }), 400);
 }
 
 function highlightNext(target) {
@@ -699,8 +823,7 @@ function highlightNext(target) {
 
 function section(id, num, title, intro) {
   return h("section", { id, class: "step-section" },
-    h("h2", {}, h("span", { class: "step-num" }, num), title),
-    h("p", { class: "muted section-intro" }, intro));
+    h("h2", {}, h("span", { class: "step-num" }, num), title), intro);
 }
 
 function renderJob() {
@@ -708,21 +831,26 @@ function renderJob() {
   const app = document.getElementById("app");
   let view = app.querySelector(".job-view");
   if (!view || Number(view.dataset.job) !== job.id) {
-    const images = section("step-images", "1", "Images",
-      "L'image de départ est le premier plan de la vidéo. Une 2ᵉ image, facultative, impose la fin : " +
-      "le rendu final arrivera dessus. Avec plusieurs images, la vidéo a un plan entre chaque paire.");
-    images.append(h("div", { class: "keyframes" }),
-      h("div", { class: "card keygen" }, h("div", { class: "keygen-form" }), h("div", { class: "keygen-list" })));
-    const shots = section("step-shots", "2-4", "Plans : aperçu, rendu final, prise à garder",
-      "Pour chaque plan : décris le mouvement, vérifie-le avec un aperçu rapide, lance le rendu final " +
-      "quand il te va, puis garde la prise qui te plaît.");
+    const film = section("step-images", "1", "Le film : images et plans",
+      helpLine(`film-${job.id}`, "De gauche à droite : une image, le plan qui en part, l'image suivante… " +
+        "Clique un plan pour le travailler, une image pour la changer.",
+      "L'image de départ ouvre la vidéo. Une 2ᵉ image, facultative, impose la fin : le rendu final arrivera " +
+        "dessus. Avec plusieurs images, la vidéo a un plan entre chaque paire, montés bout à bout."));
+    film.append(h("div", { class: "storyboard" }), h("div", { class: "kf-panel-box" }),
+      h("div", { class: "card keygen" },
+        h("div", { class: "keygen-bar" }), h("div", { class: "keygen-form" }), h("div", { class: "keygen-live" }),
+        fold(`keygens-${job.id}`, "adv keygen-history", "Images créées", h("div", { class: "keygen-list" }))));
+    const shots = section("step-shots", "2-4", "Plan",
+      helpLine(`shots-${job.id}`, "Décris le mouvement, vérifie-le avec un aperçu, lance le rendu final, " +
+        "garde la prise qui te plaît."));
     shots.append(h("div", { class: "segments" }));
     const assembly = section("step-assembly", "5", "Montage",
-      "Le montage colle bout à bout la prise gardée de chaque plan et donne la vidéo à télécharger.");
+      helpLine(`asm-${job.id}`, "Colle bout à bout la prise gardée de chaque plan ; la vidéo se télécharge ici."));
     assembly.append(h("div", { class: "assembly" }));
     view = h("div", { class: "job-view", dataset: { job: job.id } },
-      h("div", { class: "job-head" }), h("div", { class: "stepper-box" }), h("div", { class: "next-box" }),
-      images, shots, assembly);
+      h("div", { class: "job-head" }), h("div", { class: "guide" }, h("div", { class: "stepper-box" }),
+        h("div", { class: "next-box" })),
+      film, shots, assembly);
     app.replaceChildren(view);
   }
   syncOne(view.querySelector(".job-head"), JSON.stringify([job.title, job.preset_final, job.end_mode, job.status,
@@ -730,17 +858,22 @@ function renderJob() {
   const next = nextStep(job);
   syncOne(view.querySelector(".stepper-box"), JSON.stringify(stepsDone(job)), renderStepper);
   syncOne(view.querySelector(".next-box"), JSON.stringify([next, state.queue.worker.alive]), renderNext);
-  const kfs = view.querySelector(".keyframes");
-  syncList(kfs, [...job.keyframes, { id: "add" }], (k) => k.id,
-    (k) => k.id === "add" ? `add${job.keyframes.length}`
-      : JSON.stringify([k, job.keyframes.length, job.keygens.some((g) => isLive(g) && g.position === k.position)]),
-    (k) => k.id === "add" ? renderAddKeyframe(job) : renderKeyframe(job, k));
+  const v = viewOf(job);
+  const cur = currentSeg(job);
+  syncList(view.querySelector(".storyboard"), storyItems(job), (it) => it.key, (it) => storySig(job, it, next),
+    (it) => renderStoryItem(job, it));
+  const openKf = job.keyframes.find((k) => k.position === v.kf);
+  if (!openKf) v.kf = null;
+  syncOne(view.querySelector(".kf-panel-box"), JSON.stringify(openKf ? [openKf, job.keyframes.length,
+    job.keygens.some((g) => isLive(g) && g.position === openKf.position)] : null),
+  () => (openKf ? renderKeyframe(job, openKf) : []));
   updateKeygens(view, job);
   syncList(view.querySelector(".segments"), job.segments, (s) => s.id,
-    (s) => JSON.stringify([s.id, s.kf_in, s.kf_out, s.end_mode, job.preset_final, job.segments.length,
+    (s) => JSON.stringify([s.id, s.idx, s.kf_in, s.kf_out, s.end_mode, job.preset_final, job.segments.length,
       kfVersions(job, s), job.style]),
     (s) => renderSegment(job, s));
   for (const s of job.segments) updateSegment(job, s);
+  for (const card of view.querySelectorAll(".segments > .segment")) card.hidden = Number(card.dataset.key) !== cur;
   syncOne(view.querySelector(".assembly"), JSON.stringify([job.segments.map((s) => s.retained_take_id),
     job.assemblies, job.assemblies.map((a) => {
       const q = queueItem("assembly", a.id);
@@ -748,15 +881,100 @@ function renderJob() {
     })]), renderAssembly);
   view.querySelector("#step-shots").classList.toggle("locked", !job.keyframes.length);
   highlightNext(next.target);
-  if (state.route.focus) {
-    const el = document.querySelector(`[data-next="${state.route.focus}"]`);
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
-      el.classList.add("flash");
-      setTimeout(() => el.classList.remove("flash"), 2000);
-    }
+  if (state.route.focus) { // a link such as #/job/8/take-42 (queue panel)
+    const focus = state.route.focus;
     state.route.focus = null;
+    goTo(focus, { flash: true });
   }
+}
+
+// --- storyboard: the film's strip ---------------------------------------------------------------
+//
+// image 0 → [shot 1] → image 1 → … → [+ image]. A shot's card shows its retained take (else its
+// latest finished one; it plays on hover), where it stands and how many takes it has.
+
+function storyItems(job) {
+  const items = [];
+  for (const k of job.keyframes) {
+    items.push({ key: `kf-${k.position}`, k });
+    const s = job.segments.find((x) => x.kf_in === k.position);
+    if (s) items.push({ key: `seg-${s.id}`, s });
+  }
+  items.push({ key: "add" });
+  return items;
+}
+
+// The take a shot's card shows, the running one, and its line of status: [text, class].
+function shotState(s) {
+  const live = s.takes.find((t) => t.status === "running") || s.takes.find(isLive);
+  const retained = s.takes.find((t) => t.id === s.retained_take_id);
+  const shown = retained || [...s.takes].reverse().find((t) => t.status === "done" && t.output_url);
+  const done = doneOf(s).length;
+  let line;
+  if (live) {
+    const q = queueItem("take", live.id);
+    line = live.status === "running"
+      ? [`${TIER_LABELS[live.tier]} ${q ? taskPercent(q) : 0} %`, "live"] : [`${TIER_LABELS[live.tier]} en file`, "queued"];
+  } else if (retained) line = [`✓ prise #${retained.id} gardée`, "ok"];
+  else if (s.takes.at(-1)?.status === "failed") line = ["dernière prise en échec", "bad"];
+  else if (done) line = ["aucune prise gardée", "warn"];
+  else if (!s.prompt.trim()) line = ["à décrire", ""];
+  else line = ["pas encore de prise", ""];
+  return { live, shown, line };
+}
+
+function storySig(job, it, next) {
+  const v = viewOf(job);
+  if (it.k) {
+    const k = it.k;
+    return JSON.stringify([k.id, k.version, k.source_keygen_id, k.match_applied, job.keyframes.length, v.kf === k.position,
+      job.keygens.some((g) => isLive(g) && g.position === k.position)]);
+  }
+  if (it.s) {
+    const st = shotState(it.s);
+    return JSON.stringify([it.s.idx, it.s.duration_s, it.s.kf_out, st.shown?.id, st.line, it.s.takes.length,
+      currentSeg(job) === it.s.id, segOfTarget(job, next.target) === it.s.id]);
+  }
+  return `add${job.keyframes.length}`;
+}
+
+function renderStoryItem(job, it) {
+  if (!it.k && !it.s) return renderAddKeyframe(job);
+  if (it.k) {
+    const k = it.k;
+    const isStart = k.position === 0;
+    const isLast = k.position === job.keyframes.length - 1 && job.keyframes.length > 1;
+    const creating = job.keygens.some((g) => isLive(g) && g.position === k.position);
+    return h("button", { type: "button", class: `sb-kf${viewOf(job).kf === k.position ? " sel" : ""}`,
+      title: "Voir, remplacer, ajuster cette image", onclick: () => toggleKf(job, k.position) },
+    h("img", { src: kfUrl(k), alt: kfName(k) }),
+    h("span", { class: "sb-label" }, isStart ? "départ" : isLast ? `image ${k.position} · fin` : `image ${k.position}`,
+      k.source_keygen_id ? h("span", { class: "badge generated", title: "Créée par Flux 2 Klein" }, "créée") : null,
+      creating ? h("span", { class: "badge s-running" }, "en création") : null));
+  }
+  const s = it.s;
+  const { live, shown, line } = shotState(s);
+  const sel = currentSeg(job) === s.id;
+  let thumb;
+  if (shown) {
+    const mid = (shown.settings?.video_length || 1) / (shown.fps || 16) / 2;
+    thumb = h("video", { src: `${shown.output_url}#t=${mid.toFixed(2)}`, muted: true, preload: "metadata",
+      playsInline: true, loop: true, onmouseenter: (ev) => ev.target.play().catch(() => {}),
+      onmouseleave: (ev) => ev.target.pause() });
+  } else if (live?.preview_url) {
+    thumb = h("img", { src: `${live.preview_url}?t=${Date.now()}`, alt: "" });
+  } else {
+    thumb = h("span", { class: "sb-empty" }, live ? "en file…" : "—");
+  }
+  const todo = segOfTarget(job, nextStep(job).target) === s.id;
+  return h("button", { type: "button", class: `sb-seg${sel ? " sel" : ""}${s.kf_out === null ? " open-end" : ""}`,
+    title: sel ? "Ce plan est déplié plus bas" : "Déplier ce plan", onclick: () => selectSeg(job, s.id) },
+  h("span", { class: "sb-head" }, h("strong", {}, `Plan ${s.idx + 1}`),
+    h("span", { class: "muted" }, ` · ${String(s.duration_s).replace(".", ",")} s`),
+    todo ? h("span", { class: "sb-todo", title: "La prochaine chose à faire est dans ce plan" }, "à faire") : null),
+  h("span", { class: "sb-thumb" }, thumb),
+  h("span", { class: `sb-status ${line[1]}` }, line[0],
+    s.takes.length ? h("span", { class: "muted" }, ` · ${s.takes.length} prise${s.takes.length > 1 ? "s" : ""}`) : null));
 }
 
 function kfVersions(job, s) {
@@ -863,18 +1081,25 @@ function dropZone(el, onfile) {
   return el;
 }
 
+// The last tile of the storyboard: the start image (large, alone) or one more image at the end.
 function renderAddKeyframe(job) {
   const n = job.keyframes.length;
   const upload = (file) => uploadKeyframe(job, n, file, file.name);
-  return dropZone(h("div", { class: "kf add" + (n === 0 ? " first" : ""), dataset: { next: "add-kf" } },
-    h("div", { class: "kf-drop" },
-      h("strong", {}, n === 0 ? "Dépose l'image de départ ici" : n === 1 ? "Image de fin (facultatif)"
-        : `Image ${n} (facultatif)`),
-      h("div", { class: "muted small" },
-        n === 0 ? "photo, aquarelle, dessin ; une image détourée (transparence) est posée sur un fond uni"
-          : "le rendu final arrivera sur cette image. Tu peux aussi la créer (juste en dessous) " +
-            "ou en prendre une dans une prise (« Utiliser cette image »)."),
-      filePicker(upload, "Choisir un fichier", n === 0 ? "primary" : ""))), upload);
+  if (n === 0) {
+    return dropZone(h("div", { class: "kf add first", dataset: { next: "add-kf" } },
+      h("div", { class: "kf-drop" },
+        h("strong", {}, "Dépose l'image de départ ici"),
+        h("div", { class: "muted small" },
+          "photo, aquarelle, dessin ; une image détourée (transparence) est posée sur un fond uni"),
+        filePicker(upload, "Choisir un fichier", "primary"))), upload);
+  }
+  return dropZone(h("div", { class: "sb-add", dataset: { next: "add-kf" },
+    title: "Le rendu final arrivera sur cette image. Tu peux aussi la créer avec l'IA, ou en prendre une dans " +
+      "une prise (« Utiliser cette image », sous la vidéo)." },
+  h("strong", {}, n === 1 ? "+ image de fin" : "+ image"),
+  h("span", { class: "muted small" }, "facultatif · dépose-la ici"),
+  filePicker(upload, "Fichier…"),
+  h("button", { type: "button", onclick: () => openKeygen(job, n) }, "Créer…")), upload);
 }
 
 function kfName(k) { return k.position === 0 ? "image de départ" : `image ${k.position}`; }
@@ -887,32 +1112,36 @@ function renderKeyframe(job, k) {
   const replace = (file) => uploadKeyframe(job, k.position, file, file.name);
   const title = isStart ? "Image de départ" : isLast ? `Image ${k.position} · fin` : `Image ${k.position}`;
   const creating = job.keygens.find((g) => isLive(g) && g.position === k.position);
-  const card = h("div", { class: "kf" + (isStart ? " start" : "") },
-    h("div", { class: "kf-title" }, title,
-      h("span", {},
+  const card = h("div", { class: "card kf-panel" + (isStart ? " start" : "") },
+    h("img", { src: kfUrl(k), alt: kfName(k), title: "Agrandir", onclick: () => openCompare(job, k) }),
+    h("div", { class: "kf-panel-body" },
+      h("div", { class: "kf-title" }, title,
         k.source_keygen_id ? h("span", { class: "badge generated", title: `Créée par Flux 2 Klein ` +
-          `(création #${k.source_keygen_id}, plus bas)` }, "créée") : null,
+          `(création #${k.source_keygen_id}, dans « Images créées »)` }, "créée") : null,
         !isStart && k.match_applied ? h("span", { class: "badge s-done", title: "Ajustée sur l'image de départ" }, "ajustée") : null,
         creating ? h("span", { class: "badge s-running", title: `L'image créée (création #${creating.id}) la remplacera` },
-          "en création") : null)),
-    h("img", { src: kfUrl(k), alt: kfName(k), title: "Agrandir", onclick: () => openCompare(job, k) }),
-    isStart ? null : matchButtons(k, bg),
-    h("div", { class: "row small-buttons" },
-      h("button", { type: "button", onclick: () => openCompare(job, k) }, isStart ? "Agrandir" : "Avant / après"),
-      filePicker(replace, "Remplacer"),
-      h("button", { type: "button", title: "Insère une copie exacte juste après cette image (les suivantes se décalent) : " +
-        "pour un geste qui revient à cette image, un plan va vers le geste, le suivant revient sur la copie.",
-      onclick: () => act(() => api("POST", `/keyframes/${k.id}/copy`, {})) }, "Dupliquer"),
-      isLast || !isStart
-        ? h("button", { type: "button", class: "danger", onclick: () => {
-          const msg = isLast ? `Retirer l'${kfName(k)} ?`
-            : `Retirer l'${kfName(k)} ? Les deux plans autour n'en font plus qu'un (celui qui en part garde son prompt ` +
-              "et ses prises) ; les images suivantes se décalent.";
-          if (confirm(msg)) act(() => api("DELETE", `/keyframes/${k.id}`));
-        } }, "Retirer")
-        : null),
-    isStart ? startAdvanced(k, bg) : matchAdvanced(k),
-  );
+          "en création") : null,
+        h("span", { class: "spacer" }),
+        h("button", { type: "button", class: "close", title: "Fermer", onclick: () => toggleKf(job, k.position) }, "×")),
+      isStart ? null : matchButtons(k, bg),
+      h("div", { class: "row small-buttons" },
+        h("button", { type: "button", onclick: () => openCompare(job, k) }, isStart ? "Agrandir" : "Avant / après"),
+        filePicker(replace, "Remplacer"),
+        h("button", { type: "button", title: "Flux 2 Klein crée une image qui remplacera celle-ci",
+          onclick: () => openKeygen(job, k.position) }, "Recréer avec l'IA…"),
+        h("button", { type: "button", title: "Insère une copie exacte juste après cette image (les suivantes se " +
+          "décalent) : pour un geste qui revient à cette image, un plan va vers le geste, le suivant revient sur la copie.",
+        onclick: () => act(() => api("POST", `/keyframes/${k.id}/copy`, {})) }, "Dupliquer"),
+        isLast || !isStart
+          ? h("button", { type: "button", class: "danger", onclick: () => {
+            const msg = isLast ? `Retirer l'${kfName(k)} ?`
+              : `Retirer l'${kfName(k)} ? Les deux plans autour n'en font plus qu'un (celui qui en part garde son ` +
+                "prompt et ses prises) ; les images suivantes se décalent.";
+            if (confirm(msg)) act(() => api("DELETE", `/keyframes/${k.id}`));
+          } }, "Retirer")
+          : null),
+      isStart ? startAdvanced(k, bg) : matchAdvanced(k),
+      h("p", { class: "muted small" }, "Dépose un fichier sur ce panneau pour remplacer l'image.")));
   return dropZone(card, replace);
 }
 
@@ -934,7 +1163,7 @@ function startAdvanced(k, bg) {
 // The match flags live in the « Avancé » block; the buttons read them from the card.
 function matchButtons(k, bg) {
   const run = (enabled, ev) => {
-    const card = ev.target.closest(".kf");
+    const card = ev.target.closest(".kf-panel");
     act(() => api("POST", `/keyframes/${k.id}/match`, {
       enabled, background: bg,
       color_match: card.querySelector(".opt-colors").checked,
@@ -1311,14 +1540,16 @@ function renderKeygenForm(job) {
   update();
   const est = estimate(preset("keyframe-klein") || {});
   return [
-    h("h3", {}, n === 0 ? "Ou crée l'image de départ" : "Créer une image"),
-    h("p", { class: "muted small" },
-      "Un modèle d'image (Flux 2 Klein) crée une image depuis un texte et/ou des images source. ",
-      n === 0 ? "Sans image, décris toute l'image dans le prompt. "
-        : "Pour une image de fin qui garde le visage, le cadrage et le fond du départ, garde l'image de départ comme " +
-          "1re source et écris ce qui change (expression, regard, geste) : mieux qu'une image prise dans un aperçu, " +
-          "qui dérive (visage, âge). ",
-      "Prompt en anglais de préférence."),
+    h("div", { class: "keygen-title" }, h("h3", {}, n === 0 ? "Ou crée l'image de départ" : "Créer une image"),
+      h("span", { class: "spacer" }),
+      n ? h("button", { type: "button", class: "close", title: "Replier",
+        onclick: () => { viewOf(job).keygen = false; renderJob(); } }, "×") : null),
+    helpLine(`keygen-${job.id}`, "Flux 2 Klein crée une image depuis un texte et/ou des images source ; " +
+      "prompt en anglais de préférence.",
+    n === 0 ? "Sans image source, décris toute l'image dans le prompt."
+      : "Pour une image de fin qui garde le visage, le cadrage et le fond du départ, garde l'image de départ comme " +
+        "1re source et écris ce qui change (expression, regard, geste) : mieux qu'une image prise dans un aperçu, " +
+        "qui dérive (visage, âge)."),
     h("div", { class: "keygen-field" }, h("span", { class: "field-label" }, "Images source (3 au plus)"), sourcesBox),
     h("div", { class: "keygen-row" }, instruction,
       h("div", { class: "keygen-actions" }, target, aspect,
@@ -1402,18 +1633,34 @@ function openKeygenCompare(g) {
     h("div", { class: "compare" }, keygenFigures(g, null))));
 }
 
+// « Créer une image » is folded behind a button (open when the job has no image yet); the created
+// images are folded in « Images créées », except the ones queued or running.
 function updateKeygens(view, job) {
+  const open = keygenOpen(job);
+  syncOne(view.querySelector(".keygen-bar"), JSON.stringify([open, job.keyframes.length]), () => (open ? [] : [
+    h("button", { type: "button", onclick: () => openKeygen(job) }, "Créer une image avec l'IA…"),
+    h("span", { class: "muted small" }, "Flux 2 Klein : une image de fin, un geste, une variante, depuis un texte et/ou des images."),
+  ]));
+  view.querySelector(".keygen-bar").hidden = open;
   syncOne(view.querySelector(".keygen-form"), JSON.stringify([job.id, job.keyframes.map((k) => [k.position, k.version]),
     hasTakes(job), state.presets.length, job.style]), renderKeygenForm);
   const form = view.querySelector(".keygen-form");
+  form.hidden = !open;
   syncReview(form.querySelector(".review-box"), latestReview(job, (r) => r.target === "image"),
     form.querySelector("textarea.prompt"));
-  syncList(view.querySelector(".keygen-list"), [...job.keygens].reverse(), (g) => g.id, (g) => {
+  const sig = (g) => {
     const q = queueItem("keygen", g.id);
     return JSON.stringify([g.status, g.phase, g.step, g.progress, g.preview_url, g.output_url, g.error,
       g.cancel_requested, isCurrentKeygen(job, g), hasTakes(job),
       isLive(g) ? [q?.starts_in_s, Math.round(q?.remaining_s / 5)] : 0]);
-  }, (g) => renderKeygen(job, g));
+  };
+  const gens = [...job.keygens].reverse();
+  const past = gens.filter((g) => !isLive(g));
+  syncList(view.querySelector(".keygen-live"), gens.filter(isLive), (g) => g.id, sig, (g) => renderKeygen(job, g));
+  syncList(view.querySelector(".keygen-list"), past, (g) => g.id, sig, (g) => renderKeygen(job, g));
+  const history = view.querySelector(".keygen-history");
+  history.hidden = !past.length;
+  history.querySelector("summary").textContent = `Images créées (${past.length})`;
 }
 
 function openModal(content) {
@@ -1481,13 +1728,18 @@ function renderSegment(job, s) {
       h("figcaption", {}, label));
   const multi = job.segments.length > 1;
   const kinName = kin ? kfName(kin) : "image de départ";
+  const prevSeg = job.segments.find((x) => x.idx === s.idx - 1);
+  const nextSeg = job.segments.find((x) => x.idx === s.idx + 1);
   return h("div", { class: "card segment" },
     h("div", { class: "seg-head" },
-      h("h3", {}, multi ? `Plan ${s.idx + 1}` : "Plan"),
+      h("h3", {}, multi ? `Plan ${s.idx + 1} sur ${job.segments.length}` : "Plan"),
       h("span", { class: "muted" },
         s.kf_out === null ? `part de l'${kinName}, le prompt mène la suite`
           : s.end_mode === "guide" ? `de l'${kinName} vers l'image ${s.kf_out} (fin indicative)`
-            : `de l'${kinName} à l'image ${s.kf_out}`)),
+            : `de l'${kinName} à l'image ${s.kf_out}`),
+      h("span", { class: "spacer" }),
+      prevSeg ? h("button", { type: "button", onclick: () => selectSeg(job, prevSeg.id) }, `◀ Plan ${prevSeg.idx + 1}`) : null,
+      nextSeg ? h("button", { type: "button", onclick: () => selectSeg(job, nextSeg.id) }, `Plan ${nextSeg.idx + 1} ▶`) : null),
     h("div", { class: "seg-body" },
       h("div", { class: "seg-kfs" },
         thumb(kin, "début"),
@@ -1508,22 +1760,23 @@ function renderSegment(job, s) {
           h("button", { type: "button", class: "primary", dataset: { next: `final-${s.id}` },
             onclick: () => launch("final"), title: fin ? fin.label : "" },
           `Rendu final ${fin ? `(${fmtMinutes(estimate(fin))})` : ""}`)),
-        h("p", { class: "muted small" },
-          "L'aperçu (modèle rapide) sert à vérifier le prompt et le mouvement ; il part toujours de l'image de " +
-          "départ seule" + (flf ? ", donc il ne montre pas la fin que le rendu final atteindra." : ".") +
-          " Le rendu final est la version de qualité : lance-le quand l'aperçu te convient.",
-          " L'aperçu ne garde pas un style peint ou dessiné : dès sa 4ᵉ image il redessine le visage dans un " +
-          "rendu lisse. Il sert à juger le mouvement et le rythme ; le rendu final (14B) garde le style de l'image.",
-          s.kf_out !== null && s.end_mode === "guide"
-            ? " Compare la dernière image de l'aperçu avec l'image de fin indicative." : ""),
+        helpLine(`tiers-${s.id}`, "L'aperçu (rapide) juge le mouvement et le rythme ; le rendu final est la version " +
+          "de qualité, à lancer quand l'aperçu te va.",
+        "L'aperçu part toujours de l'image de départ seule" +
+          (flf ? ", donc il ne montre pas la fin que le rendu final atteindra." : ".") +
+          " Il ne garde pas un style peint ou dessiné : dès sa 4ᵉ image il redessine le visage dans un rendu lisse ;" +
+          " le rendu final (14B) garde le style de l'image." +
+          (s.kf_out !== null && s.end_mode === "guide"
+            ? " Compare la dernière image de l'aperçu avec l'image de fin indicative." : "")),
         advanced(`seg-${s.id}`,
           h("div", { class: "row" },
             h("label", { class: "inline", title: "Vide : un tirage au hasard à chaque prise. Chaque prise garde le sien." },
               "Graine (seed)", seed),
             frames)))),
     h("h4", { class: "takes-title" }, "Prises", h("span", { class: "muted small" },
-      " · chaque rendu lancé donne une prise ; coche « Garder pour le montage » sur celle qui te plaît")),
+      " · garde pour le montage celle qui te plaît")),
     h("div", { class: "takes" }),
+    fold(`older-${s.id}`, "adv older-takes", "Autres prises", h("div", { class: "takes" })),
   );
 }
 
@@ -1576,12 +1829,11 @@ function gestureHelper(job, s) {
   };
   const est = estimate(preset("keyframe-klein") || {});
   return fold(`gesture-${s.id}`, "adv gesture", "Un geste fin (clin d'œil, une main, un sourcil) ? Découper le geste",
-    h("p", { class: "muted small" },
+    helpLine(`gesture-${s.id}`, "Le geste a son image (créée par Klein) et son plan ; prévois plusieurs prises.",
       "Le rendu final ne fait pas un geste fin depuis le texte seul (il ferme les deux yeux pour un clin d'œil). " +
       "Ce qui l'approche : une image du geste créée depuis l'image qui le précède, un plan rien que pour lui, et, " +
       "pour un geste qui revient, un second plan vers une copie de cette image. Le plan finit toujours sur le geste ; " +
-      "pendant le plan, le rendu final ferme souvent les deux yeux avant (1 prise réussie sur 3 mesurées) : " +
-      "prévois plusieurs prises."),
+      "pendant le plan, le rendu final ferme souvent les deux yeux avant (1 prise réussie sur 3 mesurées)."),
     h("label", {}, "Le geste se fait", base),
     h("label", {}, "Le geste, pour créer son image (consigne d'édition, en anglais)", instruction),
     h("p", { class: "muted small" }, "Gauche / droite : Klein les lit souvent du côté du spectateur. Regarde l'image " +
@@ -1610,17 +1862,25 @@ function updateSegment(job, s) {
   if (document.activeElement !== duration && Number(duration.value) !== s.duration_s) duration.value = s.duration_s;
   syncReview(card.querySelector(".review-box"), latestReview(job, (r) => r.segment_id === s.id), prompt);
   const takes = [...s.takes].reverse();
-  const box = card.querySelector(".takes");
-  syncList(box, takes, (t) => t.id, (t) => {
+  const shownIds = shownTakeIds(s);
+  const older = takes.filter((t) => !shownIds.has(t.id));
+  const sig = (t) => {
     const q = queueItem("take", t.id);
     const live = isLive(t);
     return JSON.stringify([t.status, t.phase, t.step, t.progress, t.preview_url, t.error, t.output_url,
       s.retained_take_id === t.id, job.keyframes.length, live ? [q?.starts_in_s, Math.round(q?.remaining_s / 5)] : 0,
       live ? t.log_tail.slice(-1) : 0]);
-  }, (t) => renderTake(job, s, t));
+  };
+  const box = card.querySelector(":scope > .takes");
+  syncList(box, takes.filter((t) => shownIds.has(t.id)), (t) => t.id, sig, (t) => renderTake(job, s, t));
   if (!takes.length) {
     box.replaceChildren(h("p", { class: "muted small" }, "Pas encore de prise : lance un aperçu."));
   }
+  const olderFold = card.querySelector(".older-takes");
+  syncList(olderFold.querySelector(".takes"), older, (t) => t.id, sig, (t) => renderTake(job, s, t));
+  olderFold.hidden = !older.length;
+  olderFold.querySelector("summary").textContent = `${older.length} autre${older.length > 1 ? "s" : ""} ` +
+    `prise${older.length > 1 ? "s" : ""}`;
 }
 
 // --- takes --------------------------------------------------------------------------------------
@@ -1698,7 +1958,8 @@ function renderProgress(t, q) {
 // --- video player with frame extraction ---------------------------------------------------------
 
 function frameTool(job, url, fps, endKeyframe) {
-  const video = h("video", { src: url, controls: true, preload: "auto", muted: true, playsInline: true });
+  // metadata only: the hidden shots' and the folded takes' videos stay in the page
+  const video = h("video", { src: url, controls: true, preload: "metadata", muted: true, playsInline: true });
   const counter = h("span", { class: "mono small" }, "image –");
   const target = h("select", {});
   const n = job.keyframes.length;

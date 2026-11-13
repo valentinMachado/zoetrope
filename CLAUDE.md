@@ -49,7 +49,9 @@ job, the start image included, can also be created by Flux 2 Klein from a prompt
 three source images (job images or uploaded files): a "keygen", a task of the worker's queue,
 preset `keyframe-klein`. Only an edit of the start image keeps its identity. The job page
 follows the user's path in five steps and says what to do next from the job's state
-(`nextStep()` in `app.js`); fine settings sit in folded « Avancé » blocks. Every prompt field
+(`nextStep()` in `app.js`); it opens on the film's storyboard (image → shot → image…), unfolds one
+shot at a time and opens an image's panel on a click; older takes, « Créer une image » and its
+history are folded, help texts are one line with a « ? »; fine settings sit in « Avancé » blocks. Every prompt field
 lists instant rule findings as the user types, and offers an AI review (Qwen3 4B, Klein's text
 encoder, a `review` task at the head of the queue) that proposes a corrected prompt
 (`prompt_review.py`). A job's style (`job.style`) is put in front of its motion prompts and of
