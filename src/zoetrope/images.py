@@ -140,6 +140,26 @@ def deviation(img: Image.Image, reference: Image.Image) -> dict[str, float]:
     return {"color": round(color, 2), "pixel": round(pixel, 2)}
 
 
+#: Below this share of changed cells (see `changed_share`), a created image is taken as a copy of
+#: its source: Flux 2 Klein copies the source when it does not understand the instruction.
+#: Measured (docs/benchmark.md, "Telling an unchanged edit"): 0 for four copies, 0.003 for a wink.
+UNCHANGED_BELOW = 0.001
+
+
+def changed_share(img: Image.Image, source: Image.Image, side: int = 64, level: int = 40) -> float:
+    """Share of an edit that visibly changed from its source, 0-1: both images in grey at `side`
+    px on the long side (box filter, which smooths the model's re-encoding noise), the global
+    brightness shift removed (median difference), then the share of cells off by more than `level`
+    grey levels. A copy scores 0; a wink, the smallest edit asked of Klein here, ~0.003."""
+    k = side / max(source.size)
+    size = (max(1, round(source.width * k)), max(1, round(source.height * k)))
+    a = np.asarray(img.convert("L").resize(size, Image.BOX), dtype=np.float32)
+    b = np.asarray(source.convert("L").resize(size, Image.BOX), dtype=np.float32)
+    d = a - b
+    d = np.abs(d - np.median(d))
+    return float((d > level).mean())
+
+
 # --- keyframe preparation -----------------------------------------------------------------------
 
 

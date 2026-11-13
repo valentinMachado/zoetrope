@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS keygen (
     position         INTEGER NOT NULL,
     instruction      TEXT NOT NULL,
     sources          TEXT,
+    change           REAL,
     preset           TEXT NOT NULL,
     model_type       TEXT NOT NULL,
     memory_profile   REAL NOT NULL,
@@ -187,7 +188,7 @@ CREATE INDEX IF NOT EXISTS review_status ON review (status);
 MIGRATIONS = {
     "job": {"style": "TEXT NOT NULL DEFAULT ''"},
     "keyframe": {"source_keygen_id": "INTEGER"},
-    "keygen": {"sources": "TEXT"},
+    "keygen": {"sources": "TEXT", "change": "REAL"},
 }
 
 

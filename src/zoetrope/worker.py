@@ -5,7 +5,8 @@ It talks to the API only through the SQLite base: picks the next task (zoetrope.
 writes progress at each Wan2GP event (phase, step, last preview image, log tail, phase
 durations), honours cancel_requested, and keeps a heartbeat. Image creations (keygens, Flux 2
 Klein: a keyframe or the start image) run like takes, in the same session: loading Klein unloads
-the video model. A finished keygen's image becomes the image at its position (service.use_keygen). Assemblies run
+the video model. A finished keygen's image becomes the image at its position (service.use_keygen),
+unless it is a copy of its source (service.measure_keygen_change). Assemblies run
 in the same queue (CPU, plus RIFE on the GPU for fps x2). Prompt reviews load Qwen3 4B beside the
 session for one reply and free it (zoetrope.prompt_review.Reviewer); when the free VRAM is short,
 the session's model is released first (reloaded by the next take).
@@ -35,7 +36,7 @@ from typing import Any
 from PIL import Image
 
 from . import assembly as assembly_mod
-from . import db, paths, prompt_review, service
+from . import db, images, paths, prompt_review, service
 from . import queue as task_queue
 
 log = logging.getLogger("zoetrope.worker")
@@ -203,7 +204,8 @@ class Worker:
         self._run_model_task("take", take, paths.takes_dir(job_id), store)
 
     def run_keygen(self, gen: dict[str, Any]) -> None:
-        """Create an image; when done, it replaces the image at its position. If that
+        """Create an image; when done, it replaces the image at its position, unless the model
+        copied its source (the keygen stays done, flagged unchanged). If installing
         fails (the position no longer exists), the keygen stays done with the reason in `error`
         and the user can use it later."""
 
@@ -215,6 +217,14 @@ class Worker:
             return dest
 
         if self._run_model_task("keygen", gen, paths.keygens_dir(gen["job_id"]), store) != "done":
+            return
+        try:
+            change = service.measure_keygen_change(self.conn, gen["id"])
+        except OSError as e:  # an unreadable image: install it as before, unmeasured
+            log.warning("keygen %d change not measured: %s", gen["id"], e)
+            change = None
+        if change is not None and change < images.UNCHANGED_BELOW:
+            log.info("keygen %d copies its source (change %.4f): not installed", gen["id"], change)
             return
         try:
             service.use_keygen(self.conn, gen["id"])

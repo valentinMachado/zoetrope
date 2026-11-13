@@ -47,7 +47,11 @@ only rebuilds the parts whose data changed, so a playing video or a prompt being
 a refresh. Frames are extracted in the browser (canvas) and uploaded as keyframes; any image of a
 job, the start image included, can also be created by Flux 2 Klein from a prompt and/or up to
 three source images (job images or uploaded files): a "keygen", a task of the worker's queue,
-preset `keyframe-klein`. Only an edit of the start image keeps its identity. The job page
+preset `keyframe-klein`. Only an edit of the start image keeps its identity. Klein copies its source
+when it does not understand the instruction: such a copy is not installed and the front says so
+(`images.changed_share`, docs/benchmark.md, "Telling an unchanged edit"). « Recadrer… » makes an image
+from four corners picked on another, in the browser and without a model (perspective warp to the
+start image's size): a zoom on a part, or a panel seen at an angle made straight. The job page
 follows the user's path in five steps and says what to do next from the job's state
 (`nextStep()` in `app.js`); it opens on the film's storyboard (image → shot → image…), unfolds one
 shot at a time and opens an image's panel on a click; older takes, « Créer une image » and its

@@ -351,6 +351,42 @@ the start image included). Checked once on job 6, through Zoetrope, seeds 11 and
   illustration from frame 20 (the P9 style problem, not specific to a generated start). 9 min
   including the switch from Klein to the 5B.
 
+### When Klein copies its source
+
+Seen on a drawing (a comic page on a desk, 432x576), seed fixed per pair. A vague instruction
+("make the panel from the comic occupy the entire screen and draw it more") gives back **the
+source, unchanged**, with or without the preset's suffix: Klein copies its source when it does not
+understand what to change. A precise one works: "close-up of the top-left comic panel: the panel
+with the man in a cap and the woman fills the whole image" gives the close-up; "color the comic
+page with bright watercolor colors" colours the panels and keeps the framing.
+
+**The suffix fought any reframing.** With the old suffix ("keep the same person, face, hair, image
+style, framing, lighting and background unchanged") the precise close-up only half happens: the
+panel grows on the page but the desk and the hand stay. The suffix is now "Keep the same people,
+faces, hair and image style.": the close-up fills the image, and on the setting C portrait (seed 42,
+eyes closed and a wide smile) the result is the same as with the old suffix (same face, white
+background, cut-out fringes kept).
+
+### Telling an unchanged edit
+
+The worker measures how much a created image changed from its main source
+(`images.changed_share`): both in grey at 64 px on the long side (box filter: Klein's re-encoding
+noise averages out), the global brightness shift removed, then the share of cells off by more than
+40 grey levels. Over 11 keygens (the comic page and the setting C portrait):
+
+| Keygen                                  | Share changed | Mean abs. difference, full size |
+| --------------------------------------- | ------------- | ------------------------------- |
+| Copies of the source (vague prompt), x4 | **0**         | 6.9-8.6                         |
+| Wink (one eye closed), portrait         | **0.0026**    | 4.4                             |
+| Eyes closed and wide smile, portrait    | 0.015-0.022   | 5.8-6.5                         |
+| Colouring, close-up                     | 0.20-0.67     | 34-90                           |
+
+The mean difference does not tell a copy from a fine edit (a wink is lower than a copy); the share
+does, but with a narrow margin. Under `UNCHANGED_BELOW` = 0.001 (about 3 cells out of 3000)
+the image is not installed as a keyframe, and the front says that Klein copied its source and asks
+for a precise instruction; « Utiliser celle-ci » still installs it. An image from text alone is not
+measured.
+
 ## Prompt review: Qwen3 4B (P12)
 
 The text encoder of Flux 2 Klein (`models/Qwen3`, Qwen3 4B, int8 quanto, 36 layers, tied

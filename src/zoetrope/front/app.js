@@ -692,6 +692,13 @@ function findNextStep(job) {
       (state.queue.worker.alive ? "" : " Le moteur de rendu est arrêté : lance scripts\\start-worker.ps1."),
     target: `keygen-${liveGen.id}`, wait: true };
   }
+  const lastGen = job.keygens.reduce((a, g) => (!a || g.id > a.id ? g : a), null);
+  if (lastGen && lastGen.unchanged) {
+    return { text: `La création #${lastGen.id} a recopié sa source : Klein n'a pas compris la consigne` +
+      (isCurrentKeygen(job, lastGen) ? `, et c'est l'${posName(lastGen.position)} actuelle` : "") +
+      ". Dis précisément quoi changer et où, puis relance (« Créer une image avec l'IA… »).",
+    target: `keygen-${lastGen.id}` };
+  }
   if (!job.keyframes.length) {
     return { text: "Dépose l'image de départ (photo, aquarelle, dessin) à l'étape 1, ou crée-la juste en dessous.",
       target: "add-kf" };
@@ -1127,9 +1134,10 @@ function filePicker(onfile, label, cls = "") {
   return h("button", { type: "button", class: cls, onclick: () => input.click() }, label, input);
 }
 
-function uploadKeyframe(job, position, blob, name = "keyframe.png") {
+function uploadKeyframe(job, position, blob, name = "keyframe.png", insert = false) {
   const f = new FormData();
   f.append("position", position);
+  if (insert) f.append("insert", "true");
   f.append("file", blob, name);
   return act(() => api("POST", `/jobs/${job.id}/keyframes`, f));
 }
@@ -1194,6 +1202,8 @@ function renderKeyframe(job, k) {
         filePicker(replace, "Remplacer"),
         h("button", { type: "button", title: "Flux 2 Klein crée une image qui remplacera celle-ci",
           onclick: () => openKeygen(job, k.position) }, "Recréer avec l'IA…"),
+        h("button", { type: "button", title: "Choisis un cadre (4 coins) dans cette image : il devient une nouvelle " +
+          "image, sans IA (un zoom sur une partie, une case redressée)", onclick: () => openReframe(job, k) }, "Recadrer…"),
         h("button", { type: "button", title: "Insère une copie exacte juste après cette image (les suivantes se " +
           "décalent) : pour un geste qui revient à cette image, un plan va vers le geste, le suivant revient sur la copie.",
         onclick: () => act(() => api("POST", `/keyframes/${k.id}/copy`, {})) }, "Dupliquer"),
@@ -1255,6 +1265,206 @@ function matchAdvanced(k) {
         h("input", { type: "checkbox", class: "opt-fringes", checked: p.remove_fringes !== false }),
         "retirer les liserés")),
     devLine(k.deviation));
+}
+
+// --- reframe: a new image from four corners picked in an image ----------------------------------
+//
+// No model: the quadrilateral of the source is resampled (perspective warp, bilinear) to the start
+// image's size, so a panel seen at an angle comes out straight. « garder un rectangle » keeps the
+// frame axis-aligned at the film's aspect; off, each corner moves freely. Dragging inside moves it.
+
+// The projective map from the unit square to the quad tl, tr, br, bl (Heckbert, "Fundamentals of
+// Texture Mapping", 1989): (u, v) -> source pixel.
+function squareToQuad(q) {
+  const [[x0, y0], [x1, y1], [x2, y2], [x3, y3]] = q;
+  const dx3 = x0 - x1 + x2 - x3, dy3 = y0 - y1 + y2 - y3;
+  let a, b, d, e, g = 0, hh = 0;
+  if (Math.abs(dx3) < 1e-9 && Math.abs(dy3) < 1e-9) {
+    a = x1 - x0; b = x3 - x0; d = y1 - y0; e = y3 - y0;
+  } else {
+    const dx1 = x1 - x2, dx2 = x3 - x2, dy1 = y1 - y2, dy2 = y3 - y2;
+    const det = dx1 * dy2 - dx2 * dy1;
+    g = (dx3 * dy2 - dx2 * dy3) / det;
+    hh = (dx1 * dy3 - dx3 * dy1) / det;
+    a = x1 - x0 + g * x1; b = x3 - x0 + hh * x3; d = y1 - y0 + g * y1; e = y3 - y0 + hh * y3;
+  }
+  return (u, v) => {
+    const w = g * u + hh * v + 1;
+    return [(a * u + b * v + x0) / w, (d * u + e * v + y0) / w];
+  };
+}
+
+// The quad of `src` (ImageData) resampled into `out` (ImageData); outside the source: `bg`.
+function warpQuad(src, quad, out, bg) {
+  const map = squareToQuad(quad);
+  const { width: sw, height: sh, data: s } = src;
+  const { width: ow, height: oh, data: o } = out;
+  for (let y = 0; y < oh; y++) {
+    for (let x = 0; x < ow; x++) {
+      let [fx, fy] = map((x + 0.5) / ow, (y + 0.5) / oh);
+      fx -= 0.5; fy -= 0.5;
+      const i = 4 * (y * ow + x);
+      if (fx < -0.5 || fy < -0.5 || fx > sw - 0.5 || fy > sh - 0.5) {
+        o[i] = bg[0]; o[i + 1] = bg[1]; o[i + 2] = bg[2]; o[i + 3] = 255;
+        continue;
+      }
+      const cx = Math.min(Math.max(fx, 0), sw - 1), cy = Math.min(Math.max(fy, 0), sh - 1);
+      const x0 = Math.floor(cx), y0 = Math.floor(cy);
+      const x1 = Math.min(x0 + 1, sw - 1), y1 = Math.min(y0 + 1, sh - 1);
+      const tx = cx - x0, ty = cy - y0;
+      const p00 = 4 * (y0 * sw + x0), p10 = 4 * (y0 * sw + x1), p01 = 4 * (y1 * sw + x0), p11 = 4 * (y1 * sw + x1);
+      for (let c = 0; c < 3; c++) {
+        const top = s[p00 + c] + (s[p10 + c] - s[p00 + c]) * tx;
+        const bottom = s[p01 + c] + (s[p11 + c] - s[p01 + c]) * tx;
+        o[i + c] = top + (bottom - top) * ty;
+      }
+      o[i + 3] = 255;
+    }
+  }
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error(`Image illisible : ${src}`));
+    img.src = src;
+  });
+}
+
+async function openReframe(job, k) {
+  const start = job.keyframes.find((x) => x.position === 0);
+  let img, startImg;
+  try {
+    [img, startImg] = await Promise.all([loadImage(kfUrl(k)), loadImage(kfUrl(start))]);
+  } catch (e) { toast(e.message); return; }
+  const W = img.naturalWidth, H = img.naturalHeight;
+  const OW = startImg.naturalWidth, OH = startImg.naturalHeight, A = OW / OH;
+  const srcCanvas = h("canvas", { width: W, height: H });
+  srcCanvas.getContext("2d").drawImage(img, 0, 0);
+  const srcData = srcCanvas.getContext("2d").getImageData(0, 0, W, H);
+  const bg = start.match_params?.background || [255, 255, 255];
+
+  // initial frame: centred, 60% of the image, at the film's aspect
+  let fw = 0.6 * W, fh = fw / A;
+  if (fh > 0.6 * H) { fh = 0.6 * H; fw = fh * A; }
+  let quad = [[(W - fw) / 2, (H - fh) / 2], [(W + fw) / 2, (H - fh) / 2], [(W + fw) / 2, (H + fh) / 2],
+    [(W - fw) / 2, (H + fh) / 2]];
+
+  const NS = "http://www.w3.org/2000/svg";
+  const svgEl = (tag, attrs) => {
+    const el = document.createElementNS(NS, tag);
+    for (const [key, v] of Object.entries(attrs)) el.setAttribute(key, v);
+    return el;
+  };
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", class: "reframe-overlay" });
+  const shade = svgEl("path", { class: "reframe-shade", "fill-rule": "evenodd" });
+  const poly = svgEl("polygon", { class: "reframe-quad" });
+  const handles = quad.map((_, i) => svgEl("circle", { class: "reframe-handle", "data-i": i }));
+  svg.append(shade, poly, ...handles);
+  const rect = h("input", { type: "checkbox", checked: true });
+  const preview = h("canvas", { width: OW, height: OH, class: "reframe-preview" });
+  const pctx = preview.getContext("2d");
+  const outData = pctx.createImageData(OW, OH);
+  const info = h("span", { class: "muted small" });
+
+  let pending = false;
+  const render = () => {
+    const pts = quad.map((p) => p.join(",")).join(" ");
+    poly.setAttribute("points", pts);
+    shade.setAttribute("d", `M0,0H${W}V${H}H0Z M${quad.map((p) => p.join(",")).join(" L")}Z`);
+    const r = 7 * W / Math.max(1, svg.getBoundingClientRect().width || W);
+    handles.forEach((c, i) => { c.setAttribute("cx", quad[i][0]); c.setAttribute("cy", quad[i][1]); c.setAttribute("r", r); });
+    poly.setAttribute("stroke-width", r / 3.5);
+    const zoom = OW / Math.hypot(quad[1][0] - quad[0][0], quad[1][1] - quad[0][1]);
+    info.textContent = `zoom ×${zoom.toFixed(2)}` + (zoom > 2.5 ? " : l'image sera floue" : "");
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      warpQuad(srcData, quad, outData, bg);
+      pctx.putImageData(outData, 0, 0);
+    });
+  };
+
+  // A corner dragged with « rectangle » on: the opposite corner stays, the frame keeps the aspect.
+  const setCorner = (i, [px, py]) => {
+    if (!rect.checked) { quad[i] = [px, py]; return; }
+    const [ox, oy] = quad[(i + 2) % 4];
+    let w = Math.abs(px - ox), hgt = Math.abs(py - oy);
+    if (w / A > hgt) hgt = w / A; else w = hgt * A;
+    w = Math.max(w, 16);
+    hgt = w / A;
+    const sx = px >= ox ? 1 : -1, sy = py >= oy ? 1 : -1;
+    const x0 = Math.min(ox, ox + sx * w), x1 = Math.max(ox, ox + sx * w);
+    const y0 = Math.min(oy, oy + sy * hgt), y1 = Math.max(oy, oy + sy * hgt);
+    quad = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+  };
+  const toSrc = (ev) => {
+    const p = svg.createSVGPoint();
+    p.x = ev.clientX; p.y = ev.clientY;
+    const q = p.matrixTransform(svg.getScreenCTM().inverse());
+    return [q.x, q.y];
+  };
+  let drag = null;
+  svg.addEventListener("pointerdown", (ev) => {
+    const i = ev.target.dataset?.i;
+    drag = i !== undefined ? { corner: Number(i) } : ev.target === poly ? { from: toSrc(ev), quad: quad.map((p) => [...p]) } : null;
+    if (drag) { svg.setPointerCapture(ev.pointerId); ev.preventDefault(); }
+  });
+  svg.addEventListener("pointermove", (ev) => {
+    if (!drag) return;
+    const p = toSrc(ev);
+    if (drag.corner !== undefined) {
+      // the corner the user holds may change role when a rectangle flips: follow the nearest one
+      setCorner(drag.corner, p);
+      if (rect.checked) drag.corner = quad.reduce((best, c, j) =>
+        Math.hypot(c[0] - p[0], c[1] - p[1]) < Math.hypot(quad[best][0] - p[0], quad[best][1] - p[1]) ? j : best, 0);
+    } else {
+      const dx = p[0] - drag.from[0], dy = p[1] - drag.from[1];
+      quad = drag.quad.map(([x, y]) => [x + dx, y + dy]);
+    }
+    render();
+  });
+  const stop = () => { drag = null; };
+  svg.addEventListener("pointerup", stop);
+  svg.addEventListener("pointercancel", stop);
+  rect.addEventListener("change", () => { if (rect.checked) { setCorner(2, quad[2]); render(); } });
+
+  const n = job.keyframes.length;
+  const target = h("select", {});
+  if (k.position + 1 < n) target.append(h("option", { value: `insert:${k.position + 1}` }, `insérée juste après (image ${k.position + 1})`));
+  target.append(h("option", { value: `set:${n}` }, n === 1 ? "comme image de fin" : `comme nouvelle image ${n}`));
+  for (let i = n - 1; i >= 0; i--) {
+    target.append(h("option", { value: `set:${i}` }, i === 0 ? "à la place de l'image de départ" : `à la place de l'image ${i}`));
+  }
+  const create = async () => {
+    const [mode, p] = target.value.split(":");
+    const pos = Number(p);
+    if (mode === "set" && pos < n && !confirm(`Remplacer l'${pos === 0 ? "image de départ" : `image ${pos}`} par ce cadrage ? ` +
+      "Les prises déjà faites gardent leur copie.")) return;
+    warpQuad(srcData, quad, outData, bg);
+    pctx.putImageData(outData, 0, 0);
+    const blob = await new Promise((resolve) => preview.toBlob(resolve, "image/png"));
+    const r = await uploadKeyframe(job, pos, blob, `cadrage-${kfName(k).replace(/\W+/g, "-")}.png`, mode === "insert");
+    if (r) { closeModal(); toast(`Cadrage ajouté (image ${pos}).`, false); }
+  };
+
+  openModal(h("div", { class: "reframe" },
+    h("h3", {}, `Recadrer l'${kfName(k)}`),
+    helpLine(`reframe-${job.id}`, "Place les 4 coins du cadre voulu : il devient une nouvelle image, sans IA.",
+      "Glisse un coin pour le déplacer, l'intérieur pour déplacer le cadre. « Garder un rectangle » le garde droit, " +
+      "au format du film ; décoché, chaque coin est libre : une case vue de biais ressort redressée. L'image est " +
+      "rééchantillonnée à la taille de l'image de départ : au-delà d'un zoom ×2,5 elle devient floue. Pour un zoom " +
+      "dans un plan, mets ce cadrage en image de fin : le rendu fait le mouvement entre les deux."),
+    h("div", { class: "reframe-body" },
+      h("div", { class: "reframe-stage" }, h("img", { src: img.src, draggable: false }), svg),
+      h("figure", {}, preview, h("figcaption", {}, "résultat"))),
+    h("div", { class: "row" },
+      h("label", { class: "inline" }, rect, "garder un rectangle"),
+      info, h("span", { class: "spacer" }), target,
+      h("button", { type: "button", class: "primary", onclick: create }, "Créer l'image"))));
+  requestAnimationFrame(render); // handle sizes need the overlay laid out
 }
 
 function openCompare(job, k) {
@@ -1679,6 +1889,7 @@ function renderKeygen(job, g) {
   } else if (g.status === "running") {
     body.push(renderProgress(g, q));
   } else if (g.status === "done" && g.output_url) {
+    if (g.unchanged) body.push(unchangedWarning(g, current));
     body.push(h("div", { class: "keygen-pair" }, keygenFigures(g, () => openKeygenCompare(g))));
     if (g.durations) body.push(h("p", { class: "muted small" }, `Créée en ${fmtDuration(g.durations.total)}, le ${fmtDate(g.finished_at)}.`));
     if (g.error) body.push(h("p", { class: "muted small" }, g.error));
@@ -1689,6 +1900,22 @@ function renderKeygen(job, g) {
     body.push(fold(`klog-${g.id}`, "", "Journal", h("pre", { class: "log" }, g.log_tail.join("\n"))));
   }
   return h("div", { class: `take ${g.status}${current ? " is-retained" : ""}`, dataset: { next: `keygen-${g.id}` } }, head, body);
+}
+
+// Klein copies its source when it does not understand the instruction (service.measure_keygen_change):
+// the copy is not used (one made before the check may be the current image); the card says why and
+// what to write instead.
+function unchangedWarning(g, current) {
+  const name = posName(g.position);
+  return h("p", { class: "keygen-warning" },
+    h("strong", {}, "Klein a recopié la source"),
+    ` : il le fait quand il ne comprend pas la consigne. ` +
+    (current
+      ? `C'est pourtant l'${name} actuelle (créée avant cette vérification) : remplace-la (nouvelle création ` +
+        `ou image déposée) ou retire-la, puis tu pourras supprimer cette création. `
+      : `Cette image n'a donc pas été mise comme ${name} (« Utiliser celle-ci » la met quand même). `) +
+    `Pour la relancer, dis précisément quoi changer et où (« Close-up of the top-left panel… », ` +
+    `« Color the drawing… », « The man closes his eyes… ») plutôt qu'une intention vague.`);
 }
 
 function openKeygenCompare(g) {
@@ -1715,7 +1942,7 @@ function updateKeygens(view, job) {
     form.querySelector("textarea.prompt"));
   const sig = (g) => {
     const q = queueItem("keygen", g.id);
-    return JSON.stringify([g.status, g.phase, g.step, g.progress, g.preview_url, g.output_url, g.error,
+    return JSON.stringify([g.status, g.phase, g.step, g.progress, g.preview_url, g.output_url, g.error, g.unchanged,
       g.cancel_requested, isCurrentKeygen(job, g), hasTakes(job),
       isLive(g) ? [q?.starts_in_s, Math.round(q?.remaining_s / 5)] : 0]);
   };

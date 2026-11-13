@@ -60,7 +60,7 @@ def test_build_keygen_settings():
     s = presets.build_keygen_settings(p, instruction="Make her smile.", images=[Path("s.png")],
                                       image_size=(480, 510), seed=3)
     assert s["image_refs"] == ["s.png"] and s["video_prompt_type"] == "KI" and s["image_mode"] == 1
-    assert s["prompt"].startswith("Make her smile. Keep the same person")
+    assert s["prompt"] == "Make her smile. " + p.prompt_suffix
     assert s["seed"] == 3 and s["resolution"] == "480x512" and s["num_inference_steps"] == 4
     with pytest.raises(presets.PresetError):
         presets.build_keygen_settings(presets.load("preview"), instruction="x", images=[Path("s")],

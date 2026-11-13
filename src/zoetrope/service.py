@@ -589,8 +589,28 @@ def use_keygen(conn: sqlite3.Connection, gen_id: int) -> dict[str, Any]:
     return match_keyframe(conn, k["id"], enabled=True, background=background)
 
 
+def measure_keygen_change(conn: sqlite3.Connection, gen_id: int) -> float | None:
+    """Store how much a finished keygen's image changed from its main source (images.changed_share);
+    None for an image from text alone. Under images.UNCHANGED_BELOW the model copied its source,
+    which it does when it does not understand the instruction: the worker then leaves it out of
+    the keyframes and the front says so."""
+    g = _get(conn, "keygen", gen_id)
+    sources = _keygen_sources(g)
+    if not g["output_file"] or not sources or not Path(sources[0]["file"]).is_file():
+        return None
+    with Image.open(g["output_file"]) as out, Image.open(sources[0]["file"]) as src:
+        change = round(images.changed_share(out, src), 4)
+    db.update(conn, "keygen", gen_id, change=change)
+    return change
+
+
+def keygen_unchanged(g: dict[str, Any]) -> bool:
+    return g.get("change") is not None and g["change"] < images.UNCHANGED_BELOW
+
+
 def public_keygen(g: dict[str, Any]) -> dict[str, Any]:
     g = dict(g)
+    g["unchanged"] = keygen_unchanged(g)
     g["sources"] = [{**{k: v for k, v in m.items() if k != "file"}, "url": paths.to_url(m["file"])}
                     for m in _keygen_sources(g)]
     g["settings"] = db.loads(g["settings"], {})

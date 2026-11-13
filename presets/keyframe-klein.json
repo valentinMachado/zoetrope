@@ -6,7 +6,7 @@
   "memory_profile": 4,
   "style": "",
   "loras": [],
-  "prompt_suffix": "Keep the same person, face, hair, image style, framing, lighting and background unchanged.",
+  "prompt_suffix": "Keep the same people, faces, hair and image style.",
   "settings": {
     "model_type": "flux2_klein_4b",
     "image_mode": 1,

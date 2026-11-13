@@ -1,5 +1,5 @@
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from conftest import portrait
 from zoetrope import images
@@ -60,3 +60,16 @@ def test_prepare_fits_to_start_and_matches():
 
 def test_parse_color():
     assert images.parse_color("#FF8000") == (255, 128, 0)
+
+
+def test_changed_share_tells_a_copy_from_a_small_edit():
+    rng = np.random.default_rng(0)
+    src = Image.fromarray(rng.integers(0, 256, (240, 180, 3), dtype=np.uint8)).filter(ImageFilter.GaussianBlur(4))
+    noisy = np.asarray(src, np.int16) + rng.integers(-12, 13, (240, 180, 3)) + 15  # re-encoding noise, brighter
+    copy = Image.fromarray(np.clip(noisy, 0, 255).astype(np.uint8))
+    assert images.changed_share(copy, src) == 0
+    assert images.changed_share(copy.resize((360, 480)), src) == 0  # another size, same framing
+    edit = np.asarray(src).copy()
+    edit[60:72, 40:56] = 0  # an eye closing: a few cells out of ~3000
+    share = images.changed_share(Image.fromarray(edit), src)
+    assert images.UNCHANGED_BELOW < share < 0.02

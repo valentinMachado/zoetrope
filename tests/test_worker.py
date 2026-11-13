@@ -71,7 +71,10 @@ class FakeJob:
             w, h = (int(v) for v in self.settings["resolution"].split("x"))
             out = paths.wan2gp_output_dir() / f"image_{self.settings['seed']}.jpg"
             out.parent.mkdir(parents=True, exist_ok=True)
-            Image.new("RGB", (w, h), (90, 160, 200)).save(out, "JPEG")
+            if "vague" in self.settings["prompt"]:  # Klein copies its source when it does not understand
+                Image.open(self.settings["image_refs"][0]).convert("RGB").resize((w, h)).save(out, "JPEG", quality=90)
+            else:
+                Image.new("RGB", (w, h), (90, 160, 200)).save(out, "JPEG")
         else:
             out = paths.wan2gp_output_dir() / "clip.mp4"
             _clip(out, (180, 90, 60))
@@ -218,6 +221,24 @@ def test_keygen_replaces_the_keyframe_and_an_older_one_can_be_used_again(conn):
     assert k["source_keygen_id"] is None
 
 
+def test_a_keygen_that_copies_its_source_is_flagged_and_not_installed(conn):
+    job, _ = _job(conn, n_kf=2)
+    before = service.job_detail(conn, job["id"])["keyframes"][1]
+    g = service.create_keygen(conn, job["id"], 1, "Something vague.", sources=[0], seed=1)
+    ok = service.create_keygen(conn, job["id"], 1, "Make him smile.", sources=[0], seed=2)
+    w = Worker(conn, session_factory=FakeSession)
+    assert w.run_next()
+    detail = service.job_detail(conn, job["id"])
+    gen = next(x for x in detail["keygens"] if x["id"] == g["id"])
+    assert gen["status"] == "done" and gen["unchanged"] and gen["change"] == 0
+    assert detail["keyframes"][1]["source_keygen_id"] == before["source_keygen_id"]  # left as it was
+    assert service.use_keygen(conn, g["id"])["source_keygen_id"] == g["id"]  # the user can still use it
+    assert w.run_next()
+    gen = next(x for x in service.job_detail(conn, job["id"])["keygens"] if x["id"] == ok["id"])
+    assert not gen["unchanged"] and gen["change"] > 0.1
+    assert service.job_detail(conn, job["id"])["keyframes"][1]["source_keygen_id"] == ok["id"]
+
+
 def test_keygen_whose_position_is_gone_stays_done_with_the_reason(conn):
     job, _ = _job(conn, n_kf=2)
     g = service.create_keygen(conn, job["id"], 2, "Wave.", sources=[0], seed=1)  # would append keyframe 2
@@ -253,6 +274,7 @@ def test_text_only_keygen_creates_the_start_of_an_empty_job(conn):
     assert g["settings"]["video_prompt_type"] == "" and "image_refs" not in g["settings"]
     Worker(conn, session_factory=FakeSession).run_next()
     detail = service.job_detail(conn, job["id"])
+    assert detail["keygens"][0]["change"] is None and not detail["keygens"][0]["unchanged"]
     assert [k["position"] for k in detail["keyframes"]] == [0]
     assert detail["keyframes"][0]["source_keygen_id"] == g["id"] and len(detail["segments"]) == 1
 
