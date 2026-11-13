@@ -63,7 +63,8 @@ shot's start or end image, with a copy of that image after it for a gesture that
 shot per gesture (docs/benchmark.md, "Following a fine motion prompt"). Projects, takes, created
 images and assemblies can be deleted with their files, never while queued or running; the projects
 page sorts them by last activity and says where each one stands, and the queue panel also lists
-what finished recently.
+what finished recently, and the front chimes when a take, a created image or an assembly ends
+(switch in the queue panel).
 
 Queue order, take/keygen/review/assembly lifecycle and keyframe preparation are documented in the
 module docstrings (`queue.py`, `service.py`, `worker.py`, `prompt_review.py`, `images.py`,

@@ -287,6 +287,7 @@ async function refreshOnce() {
     renderTopbar(e);
     return;
   }
+  announceFinished();
   renderTopbar();
   try {
     if (state.route.name === "jobs") renderJobs(await api("GET", "/jobs"));
@@ -388,6 +389,66 @@ document.addEventListener("click", (ev) => {
   }
 }, true);
 
+// --- sound when a render ends -------------------------------------------------------------------
+//
+// A short chime when a take, a created image or an assembly finishes, two low notes when one fails;
+// read from the queue's recently finished tasks (reviews and cancelled tasks are not in it). It can
+// be turned off in the queue panel (localStorage). A browser plays sound only once the page has had
+// a click or a key press.
+
+const SOUND_KEY = "zoetrope.sound";
+let soundOn = (() => {
+  try { return localStorage.getItem(SOUND_KEY) !== "off"; } catch (_) { return true; }
+})();
+let heardFinished = null; // the finished tasks already known; null until the first poll
+let audioCtx = null;
+
+function unlockAudio() {
+  try {
+    audioCtx = audioCtx || new AudioContext();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+  } catch (_) { /* no Web Audio */ }
+}
+document.addEventListener("pointerdown", unlockAudio);
+document.addEventListener("keydown", unlockAudio);
+
+function chime(ok) {
+  unlockAudio();
+  if (!audioCtx) return;
+  const t0 = audioCtx.currentTime + 0.02;
+  (ok ? [660, 880, 1320] : [392, 262]).forEach((freq, i) => {
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    const t = t0 + i * 0.16;
+    o.type = "sine";
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.2, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.6);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(t);
+    o.stop(t + 0.65);
+  });
+}
+
+function announceFinished() {
+  const recent = state.queue.recent || [];
+  const key = (i) => `${i.kind}-${i.id}-${i.status}`;
+  if (heardFinished === null) { // what ended before the page was opened stays quiet
+    heardFinished = new Set(recent.map(key));
+    return;
+  }
+  const fresh = recent.filter((i) => !heardFinished.has(key(i)));
+  for (const i of fresh) heardFinished.add(key(i));
+  if (fresh.length && soundOn) chime(fresh.every((i) => i.status === "done"));
+}
+
+function setSound(on) {
+  soundOn = on;
+  try { localStorage.setItem(SOUND_KEY, on ? "on" : "off"); } catch (_) { /* private window */ }
+  if (on) chime(true);
+}
+
 function taskThumb(i) {
   return i.thumb_url ? h("img", { class: "task-thumb", src: i.thumb_url, alt: "" }) : h("span", { class: "task-thumb" });
 }
@@ -436,6 +497,10 @@ function renderQueuePanel() {
         ? `Moteur de rendu actif (pid ${w.pid}), modèle chargé : ${w.loaded_model || "aucun"}` +
           (w.loaded_model ? ` (profil ${w.loaded_profile})` : "")
         : "Moteur de rendu arrêté : lance scripts\\start-worker.ps1."),
+    h("label", { class: "inline small sound-toggle", title: "Un son quand une prise, une image créée ou un montage " +
+      "se termine (deux notes graves en cas d'échec), si la page est ouverte" },
+    h("input", { type: "checkbox", checked: soundOn, onchange: (ev) => setSound(ev.target.checked) }),
+    "Son à la fin d'un rendu"),
     q.items.length ? h("ol", { class: "tasks" }, q.items.map(renderQueueRow)) : h("p", {}, "Rien en attente."),
     q.items.length ? h("p", { class: "muted" }, `Tout sera fini dans ${fmtDuration(q.total_s)} environ.`) : null,
     q.recent?.length ? [h("h3", { class: "recent-title" }, "Terminé récemment"),

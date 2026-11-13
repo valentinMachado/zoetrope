@@ -497,3 +497,4 @@ ul.checks li.ok { color: var(--ok); list-style: none; margin-left: -18px; }
 .review p { margin: 6px 0; }
 .review blockquote.suggestion { margin: 6px 0; padding: 6px 10px; border-left: 3px solid var(--accent);
   background: var(--card); white-space: pre-wrap; }
+.sound-toggle { margin: 6px 0 2px; }
