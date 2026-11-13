@@ -13,7 +13,7 @@ from zoetrope.worker import Worker
 JOB4 = ("le visage sourit puis fait un clin d'oeil avant de se transformer en une multitude de papillon "
         "qui partent dans tous les sens")
 GOOD = ("A watercolor painting of a woman's face, loose wet brushstrokes, paint splashes on white paper. "
-        "She slowly smiles, then winks. Static camera.")
+        "She slowly smiles, then closes her eyes. Static camera.")
 
 
 def codes(text, ctx):
@@ -24,8 +24,9 @@ def codes(text, ctx):
 
 
 def test_the_job_4_prompt_misses_language_style_camera_and_has_too_many_actions():
-    assert codes(JOB4, Context("motion", duration_s=5)) == ["french", "no_style", "no_camera", "too_many_actions"]
-    found = check(JOB4, Context("motion", duration_s=5))[-1]
+    assert codes(JOB4, Context("motion", duration_s=5)) == ["french", "no_style", "no_camera", "too_many_actions",
+                                                          "fine_gesture"]
+    found = check(JOB4, Context("motion", duration_s=5))[-2]
     assert (found["actions"], found["max"]) == (3, 2)
 
 
@@ -117,6 +118,48 @@ class ClosingSession:
         self.closed += 1
 
 
+# Fine gestures (P15, from P14's takes on job 7).
+WINK_KF = "Make her wink: she closes only her left eye, her right eye stays wide open. She keeps smiling."
+TAKE16 = ("She slowly closes her right eye in a wink; her left eye stays open and she keeps the same smile. "
+          "Static camera.")
+
+
+def test_a_fine_gesture_from_text_alone_asks_for_its_image():
+    found = check("She slowly smiles, then winks. Static camera.", Context("motion", duration_s=2.5, style="w"))
+    assert found == [{"code": "fine_gesture", "gesture": "winks"}]
+    assert prompt_review.fine_gesture("Elle fait un clin d’œil") == "clin d'oeil"
+    assert prompt_review.fine_gesture("He raises one eyebrow") == "eyebrow"
+    assert prompt_review.fine_gesture("The boats rock on the waves") is None
+    # in guide mode the end image is not sent: the gesture is still from text alone
+    guide = Context("motion", end_image="guide", end_made_from=WINK_KF, style="w")
+    assert codes("She winks one eye. Static camera.", guide) == ["fine_gesture"]
+
+
+def test_a_shot_ending_on_the_gesture_image_wants_it_explicit_and_alone():
+    ctx = Context("motion", duration_s=1.5, end_image="exact", end_made_from=WINK_KF, style="w")
+    assert codes("She winks one eye while she keeps smiling. Static camera.", ctx) == ["gesture_explicit"]
+    assert codes(TAKE16, ctx) == []
+    assert codes("She slowly smiles, then closes her right eye; her left eye stays open. Static camera.", ctx) == [
+        "gesture_chained"]
+
+
+def test_the_shot_back_from_the_gesture_needs_nothing_more():
+    ctx = Context("motion", duration_s=1.5, end_image="exact", start_made_from=WINK_KF, style="w")
+    assert codes("She opens her right eye again and keeps the same smile. Static camera.", ctx) == []
+
+
+def test_left_and_right_in_an_image_prompt_are_flagged():
+    assert codes(WINK_KF, Context("image", position=2, sources=("keyframe",))) == ["side"]
+    assert codes("Make her smile", Context("image", position=2, sources=("keyframe",))) == []
+
+
+def test_the_ai_is_told_about_the_gesture():
+    ctx = Context("motion", duration_s=1.5, end_image="exact", end_made_from=WINK_KF, style="w")
+    user = prompt_review.build_messages("She winks.", ctx)[-1]["content"]
+    assert "The end image shows a fine gesture (wink)" in user
+    assert "one such gesture per shot" in prompt_review.build_messages("x", ctx)[0]["content"]
+
+
 def _job(conn):
     job = service.create_job(conn, "r")
     service.add_keyframe(conn, job["id"], 0, png_bytes(portrait()))
@@ -133,6 +176,7 @@ def test_context_tells_how_the_images_were_made(conn):
     ctx = service.review_context(conn, job["id"], "motion", segment_id=seg["id"], duration_s=4)
     assert ctx.duration_s == 4 and ctx.end_image == "exact"
     assert ctx.notes == ('The end image was created from this prompt: "Make her wink"',)
+    assert ctx.end_made_from == "Make her wink" and ctx.start_made_from is None
     img = service.review_context(conn, job["id"], "image", position=2, sources=[1, "upload"])
     assert img.sources == ("keyframe", "upload")
     assert img.notes == ('Source image 1 was created from this prompt: "Make her wink"',)
@@ -193,7 +237,8 @@ def test_api_check_review_and_cancel(outputs):
     seg = client.get(f"/api/jobs/{job['id']}").json()["segments"][0]
     r = client.post(f"/api/jobs/{job['id']}/prompt-check",
                     json={"target": "motion", "text": JOB4, "segment_id": seg["id"], "duration_s": 5})
-    assert [f["code"] for f in r.json()["findings"]] == ["french", "no_style", "no_camera", "too_many_actions"]
+    assert [f["code"] for f in r.json()["findings"]] == ["french", "no_style", "no_camera", "too_many_actions",
+                                                         "fine_gesture"]
     r = client.post(f"/api/jobs/{job['id']}/prompt-check",
                     json={"target": "image", "text": "", "position": 1, "sources": [{"keyframe": 0}, {"upload": 0}]})
     assert r.json()["findings"] == []
@@ -215,3 +260,12 @@ def test_job_style_silences_no_style_and_is_told_to_the_ai(conn):
     text_only = service.review_context(conn, job["id"], "image", position=2)
     edit = service.review_context(conn, job["id"], "image", position=2, sources=[0])
     assert text_only.style and edit.style is None
+
+
+def test_the_job_style_is_not_repeated_in_the_suggestion():
+    style = "A watercolor painting, loose wet brushstrokes"
+    reply = "PROMPT:\n[style] She slowly closes her left eye. Static camera.\nOTHER:\n- rien"
+    assert parse_reply(reply)["suggestion"].startswith("[style]")
+    assert parse_reply(reply, style=style)["suggestion"] == "She slowly closes her left eye. Static camera."
+    copied = f"PROMPT:\n{style}. The boats rock gently. Static camera.\nOTHER:\n- rien"
+    assert parse_reply(copied, style=style)["suggestion"] == "The boats rock gently. Static camera."

@@ -54,7 +54,11 @@ lists instant rule findings as the user types, and offers an AI review (Qwen3 4B
 encoder, a `review` task at the head of the queue) that proposes a corrected prompt
 (`prompt_review.py`). A job's style (`job.style`) is put in front of its motion prompts and of
 images created from text alone; FastWan previews do not keep a painted style, the 14B does
-(docs/benchmark.md, "Holding a painted style").
+(docs/benchmark.md, "Holding a painted style"). Keyframes can be inserted, copied and removed in the
+middle (segments follow, see `service.py`); a fine one-sided gesture (a wink) is not made from text
+alone, so each shot has a « Découper le geste » helper: Klein makes the gesture's image after the
+shot's start or end image, with a copy of that image after it for a gesture that comes back, one
+shot per gesture (docs/benchmark.md, "Following a fine motion prompt").
 
 Queue order, take/keygen/review/assembly lifecycle and keyframe preparation are documented in the
 module docstrings (`queue.py`, `service.py`, `worker.py`, `prompt_review.py`, `images.py`,

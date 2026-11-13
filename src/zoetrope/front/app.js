@@ -11,6 +11,9 @@
 //
 // Every prompt field (a shot's motion, an image to create) lists the rule findings as the user
 // types and offers an AI review that proposes a corrected version (P12, « prompt review » below).
+//
+// A fine gesture (a wink, one hand) gets its own shot through the gesture helper of a shot (P15,
+// « fine gestures » below): Klein makes the image of the gesture, inserted after an image of the job.
 "use strict";
 
 const POLL_ACTIVE_MS = 2000;
@@ -578,7 +581,8 @@ function renderJob() {
   syncOne(view.querySelector(".next-box"), JSON.stringify([next, state.queue.worker.alive]), renderNext);
   const kfs = view.querySelector(".keyframes");
   syncList(kfs, [...job.keyframes, { id: "add" }], (k) => k.id,
-    (k) => k.id === "add" ? `add${job.keyframes.length}` : JSON.stringify([k, job.keyframes.length]),
+    (k) => k.id === "add" ? `add${job.keyframes.length}`
+      : JSON.stringify([k, job.keyframes.length, job.keygens.some((g) => isLive(g) && g.position === k.position)]),
     (k) => k.id === "add" ? renderAddKeyframe(job) : renderKeyframe(job, k));
   updateKeygens(view, job);
   syncList(view.querySelector(".segments"), job.segments, (s) => s.id,
@@ -716,20 +720,29 @@ function renderKeyframe(job, k) {
   const bg = "#" + (p.background || [255, 255, 255]).map((c) => c.toString(16).padStart(2, "0")).join("");
   const replace = (file) => uploadKeyframe(job, k.position, file, file.name);
   const title = isStart ? "Image de départ" : isLast ? `Image ${k.position} · fin` : `Image ${k.position}`;
+  const creating = job.keygens.find((g) => isLive(g) && g.position === k.position);
   const card = h("div", { class: "kf" + (isStart ? " start" : "") },
     h("div", { class: "kf-title" }, title,
       h("span", {},
         k.source_keygen_id ? h("span", { class: "badge generated", title: `Créée par Flux 2 Klein ` +
           `(création #${k.source_keygen_id}, plus bas)` }, "créée") : null,
-        !isStart && k.match_applied ? h("span", { class: "badge s-done", title: "Ajustée sur l'image de départ" }, "ajustée") : null)),
+        !isStart && k.match_applied ? h("span", { class: "badge s-done", title: "Ajustée sur l'image de départ" }, "ajustée") : null,
+        creating ? h("span", { class: "badge s-running", title: `L'image créée (création #${creating.id}) la remplacera` },
+          "en création") : null)),
     h("img", { src: kfUrl(k), alt: kfName(k), title: "Agrandir", onclick: () => openCompare(job, k) }),
     isStart ? null : matchButtons(k, bg),
     h("div", { class: "row small-buttons" },
       h("button", { type: "button", onclick: () => openCompare(job, k) }, isStart ? "Agrandir" : "Avant / après"),
       filePicker(replace, "Remplacer"),
-      isLast
+      h("button", { type: "button", title: "Insère une copie exacte juste après cette image (les suivantes se décalent) : " +
+        "pour un geste qui revient à cette image, un plan va vers le geste, le suivant revient sur la copie.",
+      onclick: () => act(() => api("POST", `/keyframes/${k.id}/copy`, {})) }, "Dupliquer"),
+      isLast || !isStart
         ? h("button", { type: "button", class: "danger", onclick: () => {
-          if (confirm(`Retirer l'${kfName(k)} ?`)) act(() => api("DELETE", `/keyframes/${k.id}`));
+          const msg = isLast ? `Retirer l'${kfName(k)} ?`
+            : `Retirer l'${kfName(k)} ? Les deux plans autour n'en font plus qu'un (celui qui en part garde son prompt ` +
+              "et ses prises) ; les images suivantes se décalent.";
+          if (confirm(msg)) act(() => api("DELETE", `/keyframes/${k.id}`));
         } }, "Retirer")
         : null),
     isStart ? startAdvanced(k, bg) : matchAdvanced(k),
@@ -824,7 +837,7 @@ function promptTips(key, field, tips, examples) {
 
 const MOTION_TIPS = [
   "En anglais : les modèles vidéo le suivent mieux qu'en français.",
-  "Décris l'image, puis ce qui bouge, dans l'ordre : sujet, mouvement, caméra. Ex. « … smiles, then winks. Static camera ».",
+  "Décris l'image, puis ce qui bouge, dans l'ordre : sujet, mouvement, caméra. Ex. « … slowly smiles. Static camera ».",
   "Nomme le style s'il n'est pas photo (« a watercolor painting, loose wet brushstrokes, paper texture ») : sans ça, " +
     "une aquarelle ou un dessin vire vite à la photo. Le plus simple : l'écrire une fois dans « Style des images », en haut.",
   "Image peinte ou dessinée : pour que le style tienne pendant le mouvement, crée l'image de fin depuis l'image de " +
@@ -832,11 +845,19 @@ const MOTION_TIPS = [
   "Un ou deux mouvements par plan, pas une histoire : 2 à 3 s, c'est court. Pour une suite d'actions, ajoute des images et des plans.",
   "Dis ce qui ne bouge pas (« static camera », « plain white background ») pour éviter les mouvements parasites.",
   "Avec une image de fin, décris le chemin vers elle : le rendu final y arrive de toute façon.",
+  "Un geste fin et d'un seul côté (clin d'œil, une main, un sourcil) ne sort pas du texte seul : le rendu final ferme " +
+    "les deux yeux. Donne-lui son image et son plan (« Découper le geste », plus bas), puis décris-le partie par " +
+    "partie, lentement, du côté où il est sur l'image : « She slowly closes her right eye in a wink; her left eye stays " +
+    "open and she keeps the same smile ». L'image garantit le geste à la fin du plan ; avant, le rendu final ferme " +
+    "souvent les deux yeux (1 prise réussie sur 3 mesurées) : fais plusieurs prises (autre graine) et garde la meilleure.",
+  "L'aperçu ne juge pas un geste fin : sans image de fin, il ferme les deux yeux quel que soit le prompt. Il montre le " +
+    "rythme ; seul le rendu final vers l'image du geste dit si le geste passe.",
 ];
 
 const MOTION_EXAMPLES = [
   "The man smiles warmly, slowly closes his eyes and lowers his head slightly. Subtle natural facial motion, static camera, plain white background.",
-  "A watercolor painting of a woman's face, loose wet brushstrokes, paint splashes on white paper. She slowly smiles, then winks. Static camera.",
+  "A watercolor painting of a woman's face, loose wet brushstrokes, paint splashes on white paper. She slowly smiles. Static camera.",
+  "She slowly closes her right eye in a wink; her left eye stays open and she keeps the same smile. Static camera.",
   "The boats rock gently on the water, light shimmers on the waves, clouds drift slowly. Static camera.",
 ];
 
@@ -847,6 +868,8 @@ const KEYGEN_TIPS = [
   "Le visage n'est gardé que si l'image source principale (la 1re) est l'image de départ. Depuis une autre image, " +
     "ou du texte seul, le personnage peut changer : la vidéo devra alors passer d'un visage à l'autre.",
   "L'expression et le regard sont bien suivis ; un mouvement de tête ou de corps l'est mal (« lower his head » ignoré en P8).",
+  "Gauche et droite : Klein les lit souvent du côté du spectateur (« her left eye » lui a fermé l'œil droit). Regarde " +
+    "l'image créée et décris ensuite le geste du plan comme il est dessus.",
   "Texte seul : décris toute l'image, sujet, cadrage, fond et style (« a watercolor painting of… »).",
   "Plusieurs images : la 1re est la scène principale, les suivantes des personnes ou des objets à y mettre. " +
     "Dis le rôle de chacune (« Put the cat from the second image on her lap »). Une 2ᵉ image donnée comme modèle " +
@@ -858,6 +881,7 @@ const KEYGEN_TIPS = [
 const KEYGEN_EXAMPLES = [
   "Make the man close his eyes, smile widely and warmly.",
   "Make her look to the left with a surprised expression, mouth slightly open.",
+  "Make her wink: she closes only her left eye, her right eye stays wide open. She keeps smiling.",
   "Turn this photo into a watercolor painting, loose wet brushstrokes, white paper.",
   "A watercolor portrait of an old fisherman with a grey beard, facing the viewer, plain white background.",
 ];
@@ -883,6 +907,16 @@ const CHECK_TEXT = {
   too_many_actions: (f) => `${f.actions} actions à la suite pour ${f.duration_s ?? "?"} s : ${f.max} au plus tiennent ` +
     "dans un plan. Pour une suite d'actions, ajoute des images et des plans.",
   negation: () => "Une négation (« no », « without », « sans »…) : les modèles la suivent mal, dis plutôt ce que tu veux voir.",
+  fine_gesture: (f) => `Geste fin (« ${f.gesture} ») : le texte seul ne le donne pas, le rendu final le fait des deux ` +
+    "côtés (les deux yeux pour un clin d'œil). Donne-lui son image et son plan : « Découper le geste », plus bas.",
+  gesture_chained: (f) => `Ce plan finit sur l'image d'un geste fin (« ${f.gesture} ») : qu'il ne fasse que ce geste. ` +
+    "Mets les autres mouvements dans un autre plan.",
+  gesture_explicit: (f) => `Ce plan finit sur l'image d'un geste fin (« ${f.gesture} ») : décris-le partie par partie, ` +
+    "lentement, du côté où il est sur l'image, et ce qui ne bouge pas (« She slowly closes her right eye in a wink; " +
+    "her left eye stays open and she keeps the same smile »). Un prompt court ne le montre qu'aux 2 dernières images ; " +
+    "même explicite, le geste n'est pas toujours suivi : fais plusieurs prises et garde la meilleure.",
+  side: () => "Gauche / droite : Klein les lit souvent du côté du spectateur. Regarde l'image créée, et dans le prompt " +
+    "du plan, décris le geste comme il est dessus.",
 };
 
 // Rule findings under a field, refreshed as the user types. `body()` gives the prompt and where
@@ -990,7 +1024,7 @@ function keygenDraft(job) {
   return d;
 }
 
-function posName(p) { return p === 0 ? "image de départ" : `image ${p}`; }
+function posName(p) { return p < 0 ? "image retirée" : p === 0 ? "image de départ" : `image ${p}`; }
 
 function keygenTargets(job) {
   const n = job.keyframes.length;
@@ -1164,7 +1198,7 @@ function renderKeygen(job, g) {
     isLive(g)
       ? h("button", { type: "button", class: "danger", onclick: () => act(() => api("POST", `/keygens/${g.id}/cancel`)) },
         g.cancel_requested ? "annulation…" : "Annuler")
-      : [g.status === "done" && !current
+      : [g.status === "done" && !current && g.position >= 0
         ? h("button", { type: "button", title: `Remet cette image comme ${posName(g.position)}`,
           onclick: () => useKeygen(job, g) }, "Utiliser celle-ci") : null,
       h("button", { type: "button", title: "Mêmes images source et même prompt, autre tirage (graine)", onclick: again },
@@ -1294,6 +1328,7 @@ function renderSegment(job, s) {
         h("div", { class: "row" }, reviewButton(job, promptBody, save)),
         h("div", { class: "review-box" }),
         promptTips(`seg-${s.id}`, prompt, MOTION_TIPS, MOTION_EXAMPLES),
+        gestureHelper(job, s),
         h("div", { class: "row" },
           h("label", { class: "inline" }, "Durée (s)", duration),
           h("span", { class: "spacer" }),
@@ -1319,6 +1354,74 @@ function renderSegment(job, s) {
       " · chaque rendu lancé donne une prise ; coche « Garder pour le montage » sur celle qui te plaît")),
     h("div", { class: "takes" }),
   );
+}
+
+// --- fine gestures (P15) ------------------------------------------------------------------------
+//
+// A wink, one hand, an eyebrow: the 14B does not make them from text alone (P14, docs/benchmark.md,
+// « Following a fine motion prompt »). What works: Klein makes the image of the gesture from the
+// image before it, the gesture gets its own shot with an explicit prompt, and a gesture that comes
+// back gets a second shot to a copy of that image. The helper does all of it in one request
+// (POST /segments/{id}/gesture); the gesture's image holds a copy until Klein's replaces it.
+
+const GESTURE_EXAMPLE = {
+  instruction: "Make her wink: she closes only her left eye, her right eye stays wide open. She keeps smiling.",
+  prompt: "She slowly closes her right eye in a wink; her left eye stays open and she keeps the same smile. Static camera.",
+  back: "She opens her right eye again and keeps the same smile. Static camera.",
+};
+
+function gestureHelper(job, s) {
+  const field = (placeholder) => h("textarea", { class: "prompt", rows: 2, placeholder: `ex. « ${placeholder} »` });
+  const base = h("select", {},
+    s.kf_out !== null ? h("option", { value: "end" }, `après l'image de fin du plan (${posName(s.kf_out)})`) : null,
+    h("option", { value: "start" }, `au début du plan, depuis l'${posName(s.kf_in)}`));
+  const instruction = field(GESTURE_EXAMPLE.instruction);
+  const back = h("input", { type: "checkbox", checked: true });
+  const prompt = field(GESTURE_EXAMPLE.prompt);
+  const backPrompt = field(GESTURE_EXAMPLE.back);
+  const backLabel = h("label", {}, "Prompt du plan retour (facultatif)", backPrompt);
+  const result = h("p", { class: "muted small" });
+  const update = () => {
+    backLabel.hidden = !back.checked;
+    const b = base.value === "end" ? s.kf_out : s.kf_in;
+    const next = b + 1 < job.keyframes.length ? b + 1 : null;
+    const chain = [posName(b), "image du geste", back.checked ? `copie de l'${posName(b)}` : null,
+      next !== null ? `${posName(next)} actuelle` : null].filter(Boolean);
+    result.textContent = `Résultat : ${chain.join(" → ")}, un plan entre chaque image. ` +
+      (next === null ? "" : back.checked
+        ? `Le plan actuel vers l'${posName(next)} repart de la copie, identique : ses prises restent valables.`
+        : `Le plan actuel vers l'${posName(next)} repartira de l'image du geste : sa prise gardée ne l'est plus.`) +
+      (base.value === "start" ? " Ce plan garde son prompt : retires-en le geste." : "");
+  };
+  base.addEventListener("change", update);
+  back.addEventListener("change", update);
+  update();
+  const go = async () => {
+    if (!instruction.value.trim()) { toast("Décris le geste à créer (la consigne de l'image)."); return; }
+    const g = await act(() => api("POST", `/segments/${s.id}/gesture`, {
+      instruction: instruction.value, base: base.value, back: back.checked,
+      prompt: prompt.value, back_prompt: back.checked ? backPrompt.value : "" }));
+    if (g) toast(`Image du geste en création (${posName(g.position)}, ~40 s) ; les plans sont découpés.`, false);
+  };
+  const est = estimate(preset("keyframe-klein") || {});
+  return fold(`gesture-${s.id}`, "adv gesture", "Un geste fin (clin d'œil, une main, un sourcil) ? Découper le geste",
+    h("p", { class: "muted small" },
+      "Le rendu final ne fait pas un geste fin depuis le texte seul (il ferme les deux yeux pour un clin d'œil). " +
+      "Ce qui l'approche : une image du geste créée depuis l'image qui le précède, un plan rien que pour lui, et, " +
+      "pour un geste qui revient, un second plan vers une copie de cette image. Le plan finit toujours sur le geste ; " +
+      "pendant le plan, le rendu final ferme souvent les deux yeux avant (1 prise réussie sur 3 mesurées) : " +
+      "prévois plusieurs prises."),
+    h("label", {}, "Le geste se fait", base),
+    h("label", {}, "Le geste, pour créer son image (consigne d'édition, en anglais)", instruction),
+    h("p", { class: "muted small" }, "Gauche / droite : Klein les lit souvent du côté du spectateur. Regarde l'image " +
+      "créée et écris le prompt du plan comme le geste est dessus."),
+    h("label", { class: "inline" }, back, "le geste revient (un plan retour vers une copie de l'image)"),
+    h("label", {}, "Prompt du plan vers le geste (facultatif) : partie par partie, lentement, ce qui ne bouge pas",
+      prompt),
+    backLabel,
+    result,
+    h("div", { class: "row" }, h("button", { type: "button", class: "primary", onclick: go },
+      `Créer l'image du geste et découper${est ? ` (~${fmtDuration(est)})` : ""}`)));
 }
 
 // Measured phase durations of the preset, model load included (the queue gives refined ones).

@@ -63,6 +63,19 @@ SEQUENCE_MARKERS = (
 NEGATIONS = (r"\bno\b", r"\bnot\b", r"\bwithout\b", r"\bdon't\b", r"\bnever\b", r"\bpas de\b", r"\bsans\b",
              r"\bne \w+ pas\b", r"\bjamais\b")
 SHORT_WORDS = 5
+# Fine, one-sided gestures (P14, docs/benchmark.md "Following a fine motion prompt"): the 14B
+# Lightning does not make them from text alone (it closes both eyes for a wink); they need an
+# image of the gesture (made by Klein) at the end of their own segment.
+FINE_GESTURES = (
+    r"\bwink\w*", r"\bone eye\b", r"\b(?:left|right) eye\b", r"\bone hand\b", r"\b(?:left|right) hand\b",
+    r"\beyebrows?\b", r"\bone finger\b", r"\bthumbs? up\b",
+    r"\bclin d'oeil\b", r"\bun (?:seul )?oeil\b", r"\boeil (?:gauche|droit)\b", r"\bune (?:seule )?main\b",
+    r"\bmain (?:gauche|droite)\b", r"\bsourcils?\b", r"\bun (?:seul )?doigt\b", r"\bpouce\b",
+)
+# What makes a gesture prompt explicit, as in take #16: it goes slowly and says what stays.
+SLOW_WORDS = (r"\bslow", r"\bgentl", r"\blentement\b", r"\bdoucement\b")
+KEEP_WORDS = (r"\bstays?\b", r"\bkeeps?\b", r"\bremains?\b", r"\bstill\b", r"\breste\b", r"\bgarde\b")
+SIDE_WORDS = (r"\bleft\b", r"\bright\b", r"\bgauche\b", r"\bdroite?\b")
 
 
 @dataclass(frozen=True)
@@ -78,22 +91,26 @@ class Context:
     sources: tuple[str, ...] = ()  # image: "start", "keyframe" or "upload", the first is the main scene
     notes: tuple[str, ...] = field(default_factory=tuple)
     style: str | None = None  # the job's style, put in front of the prompt at render time
+    start_made_from: str | None = None  # motion: the prompt Klein made the start image from
+    end_made_from: str | None = None  # motion: the prompt Klein made the end image from
 
     def to_json(self) -> dict[str, Any]:
         return {"target": self.target, "duration_s": self.duration_s, "end_image": self.end_image,
                 "position": self.position, "sources": list(self.sources), "notes": list(self.notes),
-                "style": self.style}
+                "style": self.style, "start_made_from": self.start_made_from,
+                "end_made_from": self.end_made_from}
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> Context:
         return cls(target=d["target"], duration_s=d.get("duration_s"), end_image=d.get("end_image"),
                    position=d.get("position"), sources=tuple(d.get("sources") or ()),
-                   notes=tuple(d.get("notes") or ()), style=d.get("style"))
+                   notes=tuple(d.get("notes") or ()), style=d.get("style"),
+                   start_made_from=d.get("start_made_from"), end_made_from=d.get("end_made_from"))
 
 
 def _plain(text: str) -> str:
     """Lower case, accents stripped, apostrophes straightened."""
-    text = unicodedata.normalize("NFKD", text.replace("’", "'").lower())
+    text = unicodedata.normalize("NFKD", text.replace("’", "'").lower().replace("œ", "oe"))
     return "".join(c for c in text if not unicodedata.combining(c))
 
 
@@ -111,6 +128,19 @@ def is_french(text: str) -> bool:
     en = sum(w in ENGLISH_WORDS for w in words)
     accents = len(re.findall(r"[éèêàùçôîâû]", text.lower()))
     return fr + min(accents, 3) > en and fr + accents > 0
+
+
+def fine_gesture(text: str | None) -> str | None:
+    """The first fine, one-sided gesture the text names ("wink", "left eye"...), or None."""
+    plain = _plain(text or "")
+    found = [m for m in (re.search(p, plain) for p in FINE_GESTURES) if m]
+    return min(found, key=lambda m: m.start()).group(0) if found else None
+
+
+def is_explicit_gesture(text: str) -> bool:
+    """Said slowly, with what stays the same: the shape of take #16's prompt."""
+    plain = _plain(text)
+    return any(re.search(p, plain) for p in SLOW_WORDS) and any(re.search(p, plain) for p in KEEP_WORDS)
 
 
 def count_actions(text: str) -> int:
@@ -150,9 +180,36 @@ def check(text: str, ctx: Context) -> list[dict[str, Any]]:
         if n > allowed:
             findings.append({"code": "too_many_actions", "actions": n, "max": allowed,
                              "duration_s": ctx.duration_s})
+        findings += _gesture_findings(text, n, ctx)
+    elif _has_side(plain):
+        findings.append({"code": "side"})
     if any(re.search(p, plain) for p in NEGATIONS):
         findings.append({"code": "negation"})
     return findings
+
+
+def _has_side(plain: str) -> bool:
+    return any(re.search(p, plain) for p in SIDE_WORDS)
+
+
+def _gesture_findings(text: str, actions: int, ctx: Context) -> list[dict[str, Any]]:
+    """A fine gesture with no image to hold it: create that image (fine_gesture). A shot that ends
+    on an image of the gesture: one gesture in it (gesture_chained), said part by part and slowly
+    (gesture_explicit). A shot that starts from it (the gesture undone) needs nothing more."""
+    exact = ctx.end_image == "exact"
+    on_end = fine_gesture(ctx.end_made_from) if exact else None
+    on_start = fine_gesture(ctx.start_made_from) if exact else None
+    if on_end:
+        out = []
+        if actions > 1:
+            out.append({"code": "gesture_chained", "gesture": on_end})
+        if not is_explicit_gesture(text):
+            out.append({"code": "gesture_explicit", "gesture": on_end})
+        return out
+    gesture = fine_gesture(text)
+    if gesture and not on_start:
+        return [{"code": "fine_gesture", "gesture": gesture}]
+    return []
 
 
 # --- the AI review ------------------------------------------------------------------------------
@@ -169,7 +226,10 @@ SYSTEM_MOTION = "\n".join([
     "- has one or two movements for 2-5 seconds, not a story;",
     "- says what the camera does (\"static camera\", \"slow push-in\") and what stays still;",
     "- says what to show, not what to avoid (no negations);",
-    "- with an end image, describes the path towards it.",
+    "- with an end image, describes the path towards it;",
+    "- describes a fine one-sided gesture (a wink, one hand, an eyebrow) part by part and slowly, with what "
+    "stays the same: \"She slowly closes her right eye in a wink; her left eye stays open and she keeps the same "
+    "smile\"; one such gesture per shot.",
 ])
 
 SYSTEM_IMAGE = "\n".join([
@@ -214,6 +274,12 @@ FACTS = {
     "no_camera": "The prompt does not say what the camera does.",
     "too_many_actions": "{actions} actions in sequence for {duration_s:g} s: at most {max}; keep the first ones.",
     "negation": "The prompt uses a negation: say what to show instead.",
+    "fine_gesture": "The prompt asks for a fine one-sided gesture: replace \"{gesture}\" by that gesture said "
+                    "slowly, on one side, with what stays the same on the other side.",
+    "gesture_chained": "The end image shows a fine gesture ({gesture}) and the prompt chains other movements "
+                       "with it: keep only the gesture.",
+    "gesture_explicit": "The end image shows a fine gesture ({gesture}): describe it part by part and slowly, on "
+                        "the side the author wrote, with what stays the same (the other side, the expression).",
 }
 
 # One worked example each: a 4B model follows a shown answer better than a described one.
@@ -280,10 +346,11 @@ def build_messages(text: str, ctx: Context) -> list[dict[str, str]]:
             {"role": "assistant", "content": example[1]}, {"role": "user", "content": user}]
 
 
-def parse_reply(reply: str) -> dict[str, Any]:
+def parse_reply(reply: str, style: str | None = None) -> dict[str, Any]:
     """{"issues": [str], "suggestion": str}: the lines after PROMPT and after OTHER (colons
     optional, either order); a reply off the format is all suggestion. Stray CJK characters (Qwen
-    sometimes slips one in) are dropped."""
+    sometimes slips one in) are dropped. `style`: the job's style, put in front at render time, so
+    a [style] placeholder or a copy of the style the model wrote at the start anyway is dropped."""
     reply = CJK.sub("", reply).strip()
     parts = re.split(r"^\s*(PROMPT|OTHER|MISSING)\s*:?[ \t]*$", reply, flags=re.M)
     if len(parts) < 3:
@@ -297,8 +364,12 @@ def parse_reply(reply: str) -> dict[str, Any]:
     suggestion = " ".join((sections.get("PROMPT") or "").split()).strip().strip('"').strip()
     suggestion = re.sub(r"\s+([.,;:!?])", r"\1", suggestion)
     # "[style] of a watercolor painting": the model kept the placeholder and named the style anyway.
-    if STYLE_PLACEHOLDER in suggestion and _has_any(_plain(suggestion.replace(STYLE_PLACEHOLDER, "")), STYLE_WORDS):
+    named = _has_any(_plain(suggestion.replace(STYLE_PLACEHOLDER, "")), STYLE_WORDS)
+    if STYLE_PLACEHOLDER in suggestion and (style or named):
         suggestion = re.sub(r"\[style\](?:\s+of)?\s*", "", suggestion).strip()
+        suggestion = suggestion[:1].upper() + suggestion[1:]
+    if style and _plain(suggestion).startswith(_plain(style.strip().rstrip("."))):
+        suggestion = suggestion[len(style.strip().rstrip(".")):].lstrip(" .,;:").strip()
         suggestion = suggestion[:1].upper() + suggestion[1:]
     return {"issues": issues, "suggestion": suggestion}
 
@@ -360,7 +431,7 @@ class Reviewer:
             new = out[0, ids["input_ids"].shape[1]:]
             reply = tok.decode(new, skip_special_tokens=True)
             done = time.time()
-            return {**parse_reply(reply), "raw": reply,
+            return {**parse_reply(reply, style=ctx.style), "raw": reply,
                     "durations": {"loading_model": round(loaded - t0, 1), "inference": round(done - loaded, 1),
                                   "tokens": int(new.shape[0]), "total": round(done - t0, 1)}}
         finally:

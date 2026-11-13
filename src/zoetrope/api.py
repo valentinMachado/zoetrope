@@ -72,6 +72,19 @@ class SegmentPatch(BaseModel):
     duration_s: float | None = None
 
 
+class CopyIn(BaseModel):
+    position: int | None = None
+
+
+class GestureIn(BaseModel):
+    instruction: str
+    base: str = "end"
+    back: bool = True
+    prompt: str = ""
+    back_prompt: str = ""
+    seed: int | None = None
+
+
 class TakeIn(BaseModel):
     tier: str = "preview"
     seed: int | None = None
@@ -136,10 +149,20 @@ def patch_job(job_id: int, body: JobPatch, conn=Conn):
 
 
 @app.post("/api/jobs/{job_id}/keyframes", status_code=201)
-async def upload_keyframe(job_id: int, position: int = Form(...), file: UploadFile = File(...), conn=Conn):
+async def upload_keyframe(job_id: int, position: int = Form(...), file: UploadFile = File(...),
+                          insert: bool = Form(False), conn=Conn):
+    """At `position`: replaces the image there, or adds one at the end; with `insert`, the images
+    from `position` on move one further."""
     if position < 0:
         raise HTTPException(400, "position must be >= 0")
+    if insert:
+        return service.insert_keyframe(conn, job_id, position, await file.read())
     return service.add_keyframe(conn, job_id, position, await file.read())
+
+
+@app.post("/api/keyframes/{keyframe_id}/copy", status_code=201)
+def copy_keyframe(keyframe_id: int, body: CopyIn, conn=Conn):
+    return service.copy_keyframe(conn, keyframe_id, body.position)
 
 
 @app.post("/api/keyframes/{keyframe_id}/match")
@@ -200,6 +223,11 @@ def cancel_review(review_id: int, conn=Conn):
 @app.patch("/api/segments/{segment_id}")
 def patch_segment(segment_id: int, body: SegmentPatch, conn=Conn):
     return service.update_segment(conn, segment_id, **body.model_dump())
+
+
+@app.post("/api/segments/{segment_id}/gesture", status_code=201)
+def cut_gesture(segment_id: int, body: GestureIn, conn=Conn):
+    return service.cut_gesture(conn, segment_id, **body.model_dump())
 
 
 @app.post("/api/segments/{segment_id}/takes", status_code=201)

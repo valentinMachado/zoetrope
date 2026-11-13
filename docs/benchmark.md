@@ -502,6 +502,50 @@ previous keyframe, one gesture per segment, a prompt that describes the gesture 
 on the keyframe's side, and, for a gesture that returns, a second segment back to a copy of
 the previous keyframe. The FastWan preview does not show it.
 
+### In the tool (P15)
+
+The instant rules flag a fine gesture (`fine_gesture`: wink, one eye, left/right eye or hand, an
+eyebrow, French equivalents) in a motion prompt with no image to hold it; a shot that ends on a
+Klein image of a gesture asks for a single gesture (`gesture_chained`) said slowly with what stays
+(`gesture_explicit`); left/right in an image prompt are flagged (`side`). Each shot has a « Découper
+le geste » helper (`service.cut_gesture`), built on keyframe insertion and copy in the middle.
+
+AI review with the gesture facts, Qwen3 4B through the queue, 9-16 s each:
+
+| Prompt (context) | Rewrite |
+|---|---|
+| "She winks one eye while she keeps smiling." (job 7, ends on the wink keyframe) | "She slowly closes her left eye in a wink; her right eye stays wide open and she keeps the same smile. Static camera." |
+| "She slowly smiles, then winks." (job 7, ends on the smile) | "She slowly smiles, then slowly closes her right eye in a wink; her left eye stays open and she keeps the same smile. Static camera." |
+| "elle sourit puis fait un clin d'oeil" (ends on the wink keyframe) | "She smiles and then slowly closes her left eye while keeping her right eye wide open. Her smile remains unchanged. Static camera." |
+| job 4's French wink-and-butterflies prompt (5 s) | "A woman. She smiles widely, then slowly closes her right eye in a wink; her left eye stays open and she keeps the same smile. Static camera." |
+
+The wording of the `fine_gesture` fact counts. "Write it part by part" made the butterflies prompt
+confused ("raises her right eyelid... her left eye stays closed"). "Write that gesture slowly"
+kept "then winks" and pasted the example after it. "Replace \"winks\" by that gesture said
+slowly, on one side..." gives the rows above. The side comes from the keyframe's prompt ("left"),
+which Klein drew on her right: the AI cannot see it, so the front tells the user to check the image.
+The P12 prompts ("cat jumps", the French edit, a good prompt) come back as before. With a job style, the model
+still wrote `[style]`, or copied the style at the start, which the render puts in front anyway;
+both are now dropped after the reply.
+
+**Through the helper, job 8** (2026-11-13): start → smile (job 7's images) → a copy of the start,
+so the wink is inserted in the middle. « Découper le geste » after the smile, with the return:
+start → smile → wink → smile copy → start copy, the shot towards the start keeping its prompt.
+Klein's wink (keygen #8, 1 min 58 s with the load) is clean on the first draw: her right eye
+closed, the other open, as in P14 (4 draws out of 4). The copy is byte-identical. Then 14B finals
+of 25 frames (1.5 s) with take #16's and #17's prompts:
+
+| Take | Shot | Seed | Time | Eyes |
+|---|---|---|---|---|
+| #18 | smile → wink | 1999376551 (as #16) | 16 min 51 s with the load | open to frame 12, **both closed 13-19**, the wink from 20 |
+| #20 | smile → wink | 245629335 | 12 min 23 s | **both closed 6-21**, the wink on the last frames |
+| #19 | wink → smile copy | 1999376551 | 14 min 24 s | reopens; both closed at frames 2-4, then open |
+
+The explicit prompt that gave #16 does not do it twice with another wink image: 1 take out of 3
+in all. The end image guarantees the gesture at the end of the shot; in between, the 14B tends to
+close both eyes. Whether #16 owed it to its wink image (keygen #6) or to chance is not isolated.
+The front says so: several takes per gesture shot, keep the best.
+
 ## Recommendation
 
 **5B for previews.** It fits comfortably (5.7 GB VRAM, 24 GB RAM). FastWan (3 steps): 4 min
@@ -527,8 +571,9 @@ image made by Klein from the start keeps it through the whole move (section abov
 LoRA exists for Wan; training one is the brief's last resort.
 
 **Fine gestures** (a wink): text alone does not get them from the 14B Lightning, whatever the
-wording or the length; a keyframe of the gesture made by Klein, an explicit prompt and one
-segment per gesture do (section above).
+wording or the length; a keyframe of the gesture made by Klein and one segment per gesture
+end every take on the gesture, but the 14B often closes both eyes before it, explicit prompt or
+not (1 clean take out of 3; section above). The front's « Découper le geste » sets it up.
 
 **ComfyUI: not yet.** Wan2GP already provides everything the brief expects from ComfyUI:
 headless runs (`wgp.py --process settings.json`), a Python API (`WanGPSession`) and an MCP

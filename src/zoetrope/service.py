@@ -10,6 +10,9 @@ position, technical match applied; older keygens stay listed and `use_keygen` pu
 Segment i goes from keyframe i to keyframe i+1 and is kept in sync with the keyframes: internal
 segments are `exact` (their end frame is sent to the model), the last one takes the job's end
 mode (`exact` or `guide`; in guide mode its end keyframe only serves to judge the preview).
+A keyframe can be inserted in the middle, copied, or removed from the middle (see "Inserting and
+removing in the middle" below); `cut_gesture` uses that to give a fine gesture (a wink) its own
+segment towards an image of it made by Klein (P14-P15).
 A prompt being written gets the instant rules of zoetrope.prompt_review (`check_prompt`) and, on
 request, an AI review queued for the worker (`create_review`), given its context as text.
 """
@@ -18,6 +21,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import sqlite3
 from pathlib import Path
@@ -184,12 +188,42 @@ def add_keyframe(conn: sqlite3.Connection, job_id: int, position: int, data: byt
     """Upload (or replace) the keyframe at `position`; position 0 is the start image.
     `source_keygen_id` names the keygen the image comes from, None for an upload."""
     _get(conn, "job", job_id)
-    count = conn.execute("SELECT COUNT(*) FROM keyframe WHERE job_id = ?", (job_id,)).fetchone()[0]
+    count = _kf_count(conn, job_id)
     if position < 0 or position > count:
         raise Invalid(f"Keyframe position must be between 0 and {count}")
     orig = _open_image(data)
+    with db.transaction(conn):
+        _write_keyframe(conn, job_id, position, orig, source_keygen_id)
+        _sync_segments(conn, job_id)
+    if position == 0:
+        _reprepare_others(conn, job_id)
+    return _keyframe_at(conn, job_id, position)
+
+
+def _kf_count(conn: sqlite3.Connection, job_id: int) -> int:
+    return conn.execute("SELECT COUNT(*) FROM keyframe WHERE job_id = ?", (job_id,)).fetchone()[0]
+
+
+def _kf_row(conn: sqlite3.Connection, job_id: int, position: int) -> dict[str, Any] | None:
+    return db.row(conn.execute("SELECT * FROM keyframe WHERE job_id = ? AND position = ?",
+                               (job_id, position)).fetchone())
+
+
+def _keyframe_at(conn: sqlite3.Connection, job_id: int, position: int) -> dict[str, Any]:
+    return public_keyframe(_kf_row(conn, job_id, position))
+
+
+def _kf_files(job_id: int, position: int) -> tuple[Path, Path]:
+    """A keyframe's files are named after its position: (original, prepared)."""
     d = paths.keyframes_dir(job_id)
-    orig_file, file = d / f"{position}_orig.png", d / f"{position}.png"
+    return d / f"{position}_orig.png", d / f"{position}.png"
+
+
+def _write_keyframe(conn: sqlite3.Connection, job_id: int, position: int, orig: Image.Image,
+                    source_keygen_id: int | None) -> None:
+    """Prepare and save the image at `position`, insert or replace its row. Segments are not
+    synced: the caller does it, in its transaction."""
+    orig_file, file = _kf_files(job_id, position)
     # Every keyframe is flattened on the start image's background colour.
     start_params = _start_params(conn, job_id)
     params = images.PrepParams(background=start_params.background) if start_params else images.PrepParams()
@@ -198,21 +232,102 @@ def add_keyframe(conn: sqlite3.Connection, job_id: int, position: int, data: byt
     images.save_png(orig, orig_file)
     images.save_png(prepared, file)
     deviation = None if start is None else _deviations(orig, prepared, params, start)
+    conn.execute(
+        "INSERT INTO keyframe (job_id, position, orig_file, file, match_applied, match_params, deviation, "
+        "created_at, source_keygen_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?) ON CONFLICT (job_id, position) "
+        "DO UPDATE SET orig_file = excluded.orig_file, file = excluded.file, match_applied = 0, "
+        "match_params = excluded.match_params, deviation = excluded.deviation, created_at = excluded.created_at, "
+        "source_keygen_id = excluded.source_keygen_id",
+        (job_id, position, str(orig_file), str(file), json.dumps(params.to_json()),
+         json.dumps(deviation) if deviation else None, db.now(), source_keygen_id),
+    )
+
+
+# Inserting and removing in the middle. Keyframes, their files and the keygens that target them
+# move by one position; segment rows move too, so that a segment cut in two by an insertion keeps
+# its end image (its prompt and takes follow it) and a fresh, empty segment goes to the new image.
+# The cut segment's takes stay valid when the new image is identical to its start image (a copy,
+# as for a gesture that comes back): its retained take is kept; otherwise it is un-retained.
+# Removal is the inverse, so that undoing an insertion gives back the segment with its takes.
+
+
+def _shift_keyframes(conn: sqlite3.Connection, job_id: int, start: int, delta: int) -> None:
+    """Move the keyframes at positions >= `start` by `delta` (+1 or -1), files renamed along, and
+    the keygens targeting them. In a transaction; the slot moved into must be free."""
+    rows = db.rows(conn.execute("SELECT id, position, orig_file, file FROM keyframe WHERE job_id = ? AND "
+                                "position >= ? ORDER BY position", (job_id, start)).fetchall())
+    for k in reversed(rows) if delta > 0 else rows:
+        orig_file, file = _kf_files(job_id, k["position"] + delta)
+        os.replace(k["orig_file"], orig_file)
+        os.replace(k["file"], file)
+        db.update(conn, "keyframe", k["id"], position=k["position"] + delta, orig_file=str(orig_file), file=str(file))
+    conn.execute("UPDATE keygen SET position = position + ? WHERE job_id = ? AND position >= ?", (delta, job_id, start))
+
+
+def _shift_segments(conn: sqlite3.Connection, job_id: int, start: int, delta: int) -> None:
+    rows = conn.execute("SELECT id, idx FROM segment WHERE job_id = ? AND idx >= ? ORDER BY idx",
+                        (job_id, start)).fetchall()
+    for sid, idx in reversed(rows) if delta > 0 else rows:
+        db.update(conn, "segment", sid, idx=idx + delta)
+
+
+def _same_image(a: str | Path, b: str | Path) -> bool:
+    return Path(a).is_file() and Path(b).is_file() and Path(a).read_bytes() == Path(b).read_bytes()
+
+
+def _keep_retained_if(conn: sqlite3.Connection, job_id: int, idx: int, start_unchanged: bool) -> None:
+    """The segment at `idx` got a new start image: un-retain its take unless the image is the same."""
+    if not start_unchanged:
+        conn.execute("UPDATE segment SET retained_take_id = NULL WHERE job_id = ? AND idx = ?", (job_id, idx))
+
+
+def insert_keyframe(conn: sqlite3.Connection, job_id: int, position: int, data: bytes | None = None, *,
+                    copy_of: int | None = None) -> dict[str, Any]:
+    """Insert an image at `position` (1 to the number of keyframes; the last appends), the
+    keyframes from there on moving one further: an upload (`data`), or an exact copy of the
+    keyframe at `copy_of` (prepared image and match settings), e.g. for a gesture that comes back
+    to the image it left."""
+    _get(conn, "job", job_id)
+    count = _kf_count(conn, job_id)
+    if not 1 <= position <= count:
+        raise Invalid(f"An image is inserted at a position between 1 and {count}")
+    src, orig = None, None
+    if copy_of is not None:
+        src = _kf_row(conn, job_id, copy_of)
+        if src is None:
+            raise Invalid(f"Keyframe {copy_of} does not exist")
+        src_bytes = Path(src["orig_file"]).read_bytes(), Path(src["file"]).read_bytes()
+    else:
+        orig = _open_image(data or b"")
     with db.transaction(conn):
-        conn.execute(
-            "INSERT INTO keyframe (job_id, position, orig_file, file, match_applied, match_params, deviation, "
-            "created_at, source_keygen_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?) ON CONFLICT (job_id, position) "
-            "DO UPDATE SET orig_file = excluded.orig_file, file = excluded.file, match_applied = 0, "
-            "match_params = excluded.match_params, deviation = excluded.deviation, created_at = excluded.created_at, "
-            "source_keygen_id = excluded.source_keygen_id",
-            (job_id, position, str(orig_file), str(file), json.dumps(params.to_json()),
-             json.dumps(deviation) if deviation else None, db.now(), source_keygen_id),
-        )
+        cut = position < count  # segment position-1 -> position is cut in two
+        if cut:
+            _shift_keyframes(conn, job_id, position, +1)
+            _shift_segments(conn, job_id, position - 1, +1)
+        if src is not None:
+            orig_file, file = _kf_files(job_id, position)
+            orig_file.parent.mkdir(parents=True, exist_ok=True)
+            orig_file.write_bytes(src_bytes[0])
+            file.write_bytes(src_bytes[1])
+            conn.execute(
+                "INSERT INTO keyframe (job_id, position, orig_file, file, match_applied, match_params, deviation, "
+                "created_at, source_keygen_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (job_id, position, str(orig_file), str(file), src["match_applied"], src["match_params"],
+                 src["deviation"], db.now(), src["source_keygen_id"]))
+        else:
+            _write_keyframe(conn, job_id, position, orig, None)
         _sync_segments(conn, job_id)
-    if position == 0:
-        _reprepare_others(conn, job_id)
-    return public_keyframe(db.row(conn.execute(
-        "SELECT * FROM keyframe WHERE job_id = ? AND position = ?", (job_id, position)).fetchone()))
+        if cut:
+            _keep_retained_if(conn, job_id, position, _same_image(
+                _kf_row(conn, job_id, position)["file"], _kf_row(conn, job_id, position - 1)["file"]))
+    return _keyframe_at(conn, job_id, position)
+
+
+def copy_keyframe(conn: sqlite3.Connection, keyframe_id: int, position: int | None = None) -> dict[str, Any]:
+    """Insert an exact copy of a keyframe at `position`, by default right after it."""
+    k = _get(conn, "keyframe", keyframe_id)
+    return insert_keyframe(conn, k["job_id"], k["position"] + 1 if position is None else position,
+                           copy_of=k["position"])
 
 
 def _reprepare_others(conn: sqlite3.Connection, job_id: int) -> None:
@@ -264,14 +379,37 @@ def match_keyframe(conn: sqlite3.Connection, keyframe_id: int, *, enabled: bool 
 
 
 def delete_keyframe(conn: sqlite3.Connection, keyframe_id: int) -> None:
-    """Only the last keyframe can be removed, and only if that leaves no segment with takes."""
+    """Remove a keyframe. The last one: the segment that ends on it goes, refused if it has takes.
+    One in the middle: the two segments around it merge; the one leaving it stays (it keeps its
+    end, its takes, and its retained take if the new start image is the same), the one arriving
+    on it goes, refused if it has takes. The start image is only removed when it is alone.
+    Finished keygens that made the removed image are detached (position -1); a queued or running
+    one refuses the removal."""
     k = _get(conn, "keyframe", keyframe_id)
-    last = conn.execute("SELECT MAX(position) FROM keyframe WHERE job_id = ?", (k["job_id"],)).fetchone()[0]
-    if k["position"] != last:
-        raise Invalid("Only the last keyframe can be removed")
+    job_id, p = k["job_id"], k["position"]
+    last = conn.execute("SELECT MAX(position) FROM keyframe WHERE job_id = ?", (job_id,)).fetchone()[0]
+    if p == last:
+        with db.transaction(conn):
+            conn.execute("DELETE FROM keyframe WHERE id = ?", (keyframe_id,))
+            _sync_segments(conn, job_id)
+        return
+    if p == 0:
+        raise Invalid("The start image cannot be removed while other images follow it: replace it instead")
+    arriving = db.row(conn.execute("SELECT * FROM segment WHERE job_id = ? AND idx = ?", (job_id, p - 1)).fetchone())
+    if conn.execute("SELECT 1 FROM take WHERE segment_id = ? LIMIT 1", (arriving["id"],)).fetchone():
+        raise Invalid(f"The shot that ends on image {p} already has takes")
+    if conn.execute("SELECT 1 FROM keygen WHERE job_id = ? AND position = ? AND status IN ('queued', 'running')",
+                    (job_id, p)).fetchone():
+        raise Invalid(f"An image is being created for image {p}: cancel it first")
+    same = _same_image(k["file"], _kf_row(conn, job_id, p - 1)["file"])
     with db.transaction(conn):
+        conn.execute("DELETE FROM segment WHERE id = ?", (arriving["id"],))
         conn.execute("DELETE FROM keyframe WHERE id = ?", (keyframe_id,))
-        _sync_segments(conn, k["job_id"])
+        conn.execute("UPDATE keygen SET position = -1 WHERE job_id = ? AND position = ?", (job_id, p))
+        _shift_segments(conn, job_id, p, -1)
+        _shift_keyframes(conn, job_id, p + 1, -1)
+        _sync_segments(conn, job_id)
+        _keep_retained_if(conn, job_id, p - 1, same)
 
 
 def public_keyframe(k: dict[str, Any]) -> dict[str, Any]:
@@ -400,6 +538,8 @@ def use_keygen(conn: sqlite3.Connection, gen_id: int) -> dict[str, Any]:
     g = _get(conn, "keygen", gen_id)
     if g["status"] != "done" or not g["output_file"] or not Path(g["output_file"]).is_file():
         raise Invalid(f"Keygen {gen_id} has no image")
+    if g["position"] < 0:
+        raise Invalid(f"The image keygen {gen_id} was made for has been removed")
     k = add_keyframe(conn, g["job_id"], g["position"], Path(g["output_file"]).read_bytes(), source_keygen_id=gen_id)
     if g["position"] == 0:
         return k
@@ -446,15 +586,16 @@ def review_context(conn: sqlite3.Connection, job_id: int, target: str, *, segmen
             raise Invalid("That segment belongs to another job")
         end = None if seg["kf_out"] is None else seg["end_mode"]
         notes = []
-        made = _created_from(conn, job_id, seg["kf_in"])
-        if made:
+        made_in = _created_from(conn, job_id, seg["kf_in"])
+        if made_in:
             notes.append("The start image of this shot was created by an image model from this prompt "
-                         f"(it tells its style and subject): \"{made}\"")
-        made = _created_from(conn, job_id, seg["kf_out"]) if seg["kf_out"] is not None else None
-        if made:
-            notes.append(f"The end image was created from this prompt: \"{made}\"")
+                         f"(it tells its style and subject): \"{made_in}\"")
+        made_out = _created_from(conn, job_id, seg["kf_out"]) if seg["kf_out"] is not None else None
+        if made_out:
+            notes.append(f"The end image was created from this prompt: \"{made_out}\"")
         return prompt_review.Context("motion", duration_s=duration_s or seg["duration_s"], end_image=end,
-                                     notes=tuple(notes), style=style)
+                                     notes=tuple(notes), style=style, start_made_from=made_in,
+                                     end_made_from=made_out)
     if target != "image":
         raise Invalid(f"target must be one of {', '.join(prompt_review.TARGETS)}")
     kinds, notes = [], []
@@ -536,6 +677,38 @@ def update_segment(conn: sqlite3.Connection, segment_id: int, *, prompt: str | N
         fields["duration_s"] = duration_s
     db.update(conn, "segment", segment_id, **fields)
     return _get(conn, "segment", segment_id)
+
+
+def cut_gesture(conn: sqlite3.Connection, segment_id: int, instruction: str, *, base: str = "end",
+                back: bool = True, prompt: str = "", back_prompt: str = "", seed: int | None = None) -> dict[str, Any]:
+    """Give a fine gesture (a wink) its own segment, the way P14 got one (docs/benchmark.md,
+    "Following a fine motion prompt"): Klein makes the image of the gesture from the segment's
+    start or end image b (`base`), which goes right after b; with `back`, a copy of b follows it,
+    so the gesture is undone in a second segment. Until the keygen finishes, the gesture's slot
+    holds a copy of b, which the keygen's image replaces. The return copy is inserted first: the
+    segment after b, if any, then starts from an identical image and keeps its takes. `prompt` and
+    `back_prompt` go to the segments b -> gesture and gesture -> copy. Returns the keygen."""
+    seg = _get(conn, "segment", segment_id)
+    job_id = seg["job_id"]
+    if base not in ("start", "end"):
+        raise Invalid("base must be 'start' or 'end'")
+    b = seg["kf_in"] if base == "start" else seg["kf_out"]
+    if b is None:
+        raise Invalid("This shot has no end image: make the gesture from its start image")
+    if not instruction.strip():
+        raise Invalid("Say what the gesture is (the instruction for the image)")
+    if back:
+        insert_keyframe(conn, job_id, b + 1, copy_of=b)
+    insert_keyframe(conn, job_id, b + 1, copy_of=b)
+    gen = create_keygen(conn, job_id, b + 1, instruction, sources=[b], seed=seed)
+    with db.transaction(conn):
+        # The gesture's slot is about to change: no take made before is retained on either side.
+        conn.execute("UPDATE segment SET retained_take_id = NULL WHERE job_id = ? AND (kf_in = ? OR kf_out = ?)",
+                     (job_id, b + 1, b + 1))
+        for idx, text in ((b, prompt), (b + 1, back_prompt if back else "")):
+            if text.strip():
+                conn.execute("UPDATE segment SET prompt = ? WHERE job_id = ? AND idx = ?", (text.strip(), job_id, idx))
+    return gen
 
 
 def retain_take(conn: sqlite3.Connection, segment_id: int, take_id: int | None) -> dict[str, Any]:

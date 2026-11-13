@@ -346,6 +346,8 @@ details.adv { font-size: 12px; }
 details.adv > summary { cursor: pointer; color: var(--muted); user-select: none; width: fit-content; }
 details.adv[open] > summary { margin-bottom: 6px; }
 details.adv > * + * { margin-top: 6px; }
+details.gesture > summary { color: var(--accent); }
+details.gesture[open] { border-left: 3px solid var(--accent); padding-left: 10px; }
 
 .takes-title { margin: 16px 0 0; font-size: 14px; }
 label.retain { font-size: 13px; color: var(--text); font-weight: 600; }
