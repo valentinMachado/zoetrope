@@ -58,7 +58,10 @@ images created from text alone; FastWan previews do not keep a painted style, th
 middle (segments follow, see `service.py`); a fine one-sided gesture (a wink) is not made from text
 alone, so each shot has a « Découper le geste » helper: Klein makes the gesture's image after the
 shot's start or end image, with a copy of that image after it for a gesture that comes back, one
-shot per gesture (docs/benchmark.md, "Following a fine motion prompt").
+shot per gesture (docs/benchmark.md, "Following a fine motion prompt"). Projects, takes, created
+images and assemblies can be deleted with their files, never while queued or running; the projects
+page sorts them by last activity and says where each one stands, and the queue panel also lists
+what finished recently.
 
 Queue order, take/keygen/review/assembly lifecycle and keyframe preparation are documented in the
 module docstrings (`queue.py`, `service.py`, `worker.py`, `prompt_review.py`, `images.py`,

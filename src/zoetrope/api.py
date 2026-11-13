@@ -148,6 +148,12 @@ def patch_job(job_id: int, body: JobPatch, conn=Conn):
     return service.job_detail(conn, job_id)
 
 
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: int, conn=Conn):
+    """The job, its rows and its folder; refused while one of its tasks is queued or running."""
+    return service.delete_job(conn, job_id)
+
+
 @app.post("/api/jobs/{job_id}/keyframes", status_code=201)
 async def upload_keyframe(job_id: int, position: int = Form(...), file: UploadFile = File(...),
                           insert: bool = Form(False), conn=Conn):
@@ -205,6 +211,11 @@ def cancel_keygen(gen_id: int, conn=Conn):
     return service.cancel(conn, "keygen", gen_id)
 
 
+@app.delete("/api/keygens/{gen_id}")
+def delete_keygen(gen_id: int, conn=Conn):
+    return service.delete_keygen(conn, gen_id)
+
+
 @app.post("/api/jobs/{job_id}/prompt-check")
 def check_prompt(job_id: int, body: PromptIn, conn=Conn):
     return {"findings": service.check_prompt(conn, job_id, body.target, body.text, **body.where())}
@@ -255,6 +266,12 @@ def cancel_take(take_id: int, conn=Conn):
     return service.cancel(conn, "take", take_id)
 
 
+@app.delete("/api/takes/{take_id}")
+def delete_take(take_id: int, conn=Conn):
+    """Also when retained (the front asks first): its shot then has no retained take."""
+    return service.delete_take(conn, take_id)
+
+
 @app.post("/api/jobs/{job_id}/assemblies", status_code=201)
 def create_assembly(job_id: int, body: AssemblyIn, conn=Conn):
     return service.create_assembly(conn, job_id, color_match=body.color_match, fps_mode=body.fps_mode)
@@ -263,6 +280,11 @@ def create_assembly(job_id: int, body: AssemblyIn, conn=Conn):
 @app.post("/api/assemblies/{assembly_id}/cancel")
 def cancel_assembly(assembly_id: int, conn=Conn):
     return service.cancel(conn, "assembly", assembly_id)
+
+
+@app.delete("/api/assemblies/{assembly_id}")
+def delete_assembly(assembly_id: int, conn=Conn):
+    return service.delete_assembly(conn, assembly_id)
 
 
 @app.get("/api/queue")

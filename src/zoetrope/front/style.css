@@ -143,9 +143,25 @@ label.inline { flex-direction: row; align-items: center; gap: 6px; }
   padding: 14px;
   box-shadow: 0 8px 30px rgb(0 0 0 / 0.18);
 }
-#queue-panel ol { padding-left: 20px; }
-#queue-panel li { margin-bottom: 8px; }
-#queue-panel li.running { font-weight: 600; }
+#queue-panel h3 { margin-bottom: 4px; }
+#queue-panel .recent-title { margin-top: 16px; }
+ol.tasks { list-style: none; padding: 0; margin: 8px 0; display: flex; flex-direction: column; gap: 8px; }
+li.task { display: flex; gap: 10px; align-items: flex-start; }
+li.task.running { background: var(--soft); border-radius: 8px; padding: 6px; margin: 0 -6px; }
+.task-thumb { flex: 0 0 48px; width: 48px; height: 48px; object-fit: cover; border-radius: 6px; background: var(--soft); }
+.task-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.task-text a { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+li.task > button { font-size: 12px; padding: 2px 8px; }
+ol.recent li.task { opacity: 0.9; }
+.ok-text { color: var(--ok); }
+
+#queue-toggle { position: relative; overflow: hidden; }
+#queue-toggle.busy { color: var(--accent); border-color: var(--accent); }
+.mini-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: transparent; }
+.mini-bar > span { display: block; height: 100%; background: var(--accent); transition: width 0.5s; }
+
+.flash { animation: flash 2s ease-out; }
+@keyframes flash { from { box-shadow: 0 0 0 4px var(--accent); } to { box-shadow: 0 0 0 4px transparent; } }
 
 #toast {
   position: fixed;
@@ -166,22 +182,43 @@ main { max-width: 1240px; margin: 0 auto; padding: 16px 20px 80px; }
 
 /* --- jobs --- */
 
-.jobs-view { display: grid; grid-template-columns: 320px 1fr; gap: 20px; align-items: start; }
-.new-job { display: flex; flex-direction: column; gap: 10px; }
-.new-job h2 { margin: 0; }
-.jobs-side { display: flex; flex-direction: column; gap: 14px; }
+.jobs-view { display: flex; flex-direction: column; gap: 14px; }
+.jobs-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.jobs-head h2 { margin: 0; font-size: 20px; }
+.new-job { display: flex; flex-direction: column; gap: 10px; max-width: 520px; }
+.new-job[hidden] { display: none; }
 .how ol { padding-left: 20px; margin: 8px 0; }
 .how li { margin-bottom: 4px; }
-h2.first { margin-top: 0; }
-.job-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px; }
-.job-card { padding: 0; overflow: hidden; color: inherit; text-decoration: none; display: flex; flex-direction: column; }
+.how-box { max-width: 720px; }
+.how-fold .how { margin-top: 6px; font-size: 14px; }
+.job-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px; }
+.job-card { position: relative; padding: 0; overflow: visible; }
 .job-card:hover { border-color: var(--accent); }
-.job-card img, .no-thumb { width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background: var(--soft); }
+.job-card-link { color: inherit; text-decoration: none; display: flex; flex-direction: column; }
+.job-card img, .no-thumb {
+  width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background: var(--soft); border-radius: 10px 10px 0 0;
+}
 .no-thumb { display: grid; place-items: center; color: var(--muted); }
-.job-card-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; }
+.job-card-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; }
+.job-todo { font-size: 13px; }
+.job-todo.live { color: var(--accent); font-weight: 600; }
+.job-todo.queued { color: var(--warn); font-weight: 600; }
+.job-todo.ok { color: var(--ok); font-weight: 600; }
+.job-todo.bad { color: var(--bad); }
+.card-menu-button {
+  position: absolute; top: 6px; right: 6px; padding: 0 8px; font-size: 16px; line-height: 22px;
+  background: var(--card); opacity: 0.85;
+}
+.card-menu {
+  position: absolute; top: 34px; right: 6px; z-index: 4; display: flex; flex-direction: column;
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 4px;
+  box-shadow: 0 6px 20px rgb(0 0 0 / 0.18);
+}
+.card-menu[hidden] { display: none; }
+.card-menu button { border: none; background: none; text-align: left; padding: 6px 10px; }
+.card-menu button:hover { background: var(--soft); }
 
 @media (max-width: 720px) {
-  .jobs-view { grid-template-columns: 1fr; }
   main { padding: 12px 16px 60px; }
 }
 

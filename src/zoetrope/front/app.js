@@ -103,6 +103,30 @@ function fmtDate(t) {
   return new Date(t * 1000).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" });
 }
 
+function fmtAgo(t) {
+  const s = Date.now() / 1000 - t;
+  if (s < 60) return "à l'instant";
+  if (s < 3600) return `il y a ${Math.floor(s / 60)} min`;
+  if (s < 86400) return `il y a ${Math.floor(s / 3600)} h`;
+  if (s < 7 * 86400) return `il y a ${Math.floor(s / 86400)} j`;
+  return `le ${new Date(t * 1000).toLocaleDateString("fr-FR", { dateStyle: "short" })}`;
+}
+
+function fmtBytes(n) {
+  if (!n) return "0 Mo";
+  if (n < 1e6) return `${Math.max(1, Math.round(n / 1e3))} ko`;
+  if (n < 1e9) return `${(n / 1e6).toFixed(n < 1e7 ? 1 : 0).replace(".", ",")} Mo`;
+  return `${(n / 1e9).toFixed(1).replace(".", ",")} Go`;
+}
+
+// Delete after a confirmation; says how much was freed. `done`: « Prise supprimée ».
+async function deleteThing(path, msg, done) {
+  if (!confirm(msg)) return null;
+  const r = await act(() => api("DELETE", path));
+  if (r) toast(`${done}${r.freed_bytes ? `, ${fmtBytes(r.freed_bytes)} libérés` : ""}.`, false);
+  return r;
+}
+
 function framesFor(durationS, fps) { // same rule as presets.frames_for: Wan models take 4n+1 frames
   const n = Math.max(1, Math.round(durationS * fps) - 1);
   return 4 * Math.max(1, Math.round(n / 4)) + 1;
@@ -199,8 +223,9 @@ function syncOne(container, sig, render) {
 // --- routing and polling ------------------------------------------------------------------------
 
 function parseRoute() {
-  const m = location.hash.match(/^#\/job\/(\d+)/);
-  return m ? { name: "job", id: Number(m[1]) } : { name: "jobs" };
+  // #/job/8, or #/job/8/take-42 to scroll to a take (data-next of the element) once the page is built.
+  const m = location.hash.match(/^#\/job\/(\d+)(?:\/([\w-]+))?/);
+  return m ? { name: "job", id: Number(m[1]), focus: m[2] || null } : { name: "jobs" };
 }
 
 window.addEventListener("hashchange", () => {
@@ -267,6 +292,27 @@ function queueItem(kind, id) {
 
 // --- top bar, worker, queue ---------------------------------------------------------------------
 
+const KIND_PATHS = { take: "takes", keygen: "keygens", assembly: "assemblies", review: "reviews" };
+
+// What a queue task (or a recently finished one) is, in words.
+function taskWhat(i) {
+  if (i.kind === "take") return `plan ${i.segment_idx + 1} · ${TIER_LABELS[i.tier] || i.tier} (prise #${i.id})`;
+  if (i.kind === "keygen") return `création de l'${posName(i.position)} (#${i.id})`;
+  if (i.kind === "review") return `relecture IA du prompt ${i.target === "motion" ? `du plan ${i.segment_idx + 1}` : "d'image"}`;
+  return `montage ${i.id}`;
+}
+
+// Link to a task in its job page: the page scrolls to it once loaded (see renderJob).
+function taskHref(i) {
+  const focus = { take: `take-${i.id}`, keygen: `keygen-${i.id}`, assembly: `asm-${i.id}` }[i.kind];
+  return `#/job/${i.job_id}${focus ? `/${focus}` : ""}`;
+}
+
+function taskPercent(i) {
+  if (i.phase === "inference" && i.total_steps) return Math.round(100 * (i.step || 0) / i.total_steps);
+  return i.progress ?? 0;
+}
+
 function renderTopbar(error) {
   const pill = document.getElementById("worker-pill");
   const banner = document.getElementById("banner");
@@ -298,83 +344,188 @@ function renderTopbar(error) {
   banner.hidden = w.alive || q.items.length === 0;
   banner.textContent = "Des rendus attendent mais le moteur de rendu est arrêté : lance scripts\\start-worker.ps1.";
 
+  // The queue pill: how many tasks and how long; a thin bar under it follows the running one.
   const toggle = document.getElementById("queue-toggle");
-  toggle.textContent = q.items.length
-    ? `File d'attente : ${q.items.length} · ${fmtDuration(q.total_s)}` : "File d'attente : vide";
+  const running = q.items.find((i) => i.status === "running");
+  toggle.replaceChildren(...[
+    q.items.length ? `File d'attente : ${q.items.length} · ${fmtDuration(q.total_s)}` : "File d'attente : vide",
+    running ? h("span", { class: "mini-bar" }, h("span", { style: `width:${Math.max(3, taskPercent(running))}%` })) : null,
+  ].filter(Boolean));
+  toggle.classList.toggle("busy", Boolean(running));
   renderQueuePanel();
 }
 
-document.getElementById("queue-toggle").addEventListener("click", () => {
+document.getElementById("queue-toggle").addEventListener("click", (ev) => {
+  ev.stopPropagation();
   const p = document.getElementById("queue-panel");
   p.hidden = !p.hidden;
 });
+document.addEventListener("click", (ev) => { // a click outside closes the panel
+  const p = document.getElementById("queue-panel");
+  if (!p.hidden && !p.contains(ev.target)) p.hidden = true;
+});
+
+function taskThumb(i) {
+  return i.thumb_url ? h("img", { class: "task-thumb", src: i.thumb_url, alt: "" }) : h("span", { class: "task-thumb" });
+}
+
+function renderQueueRow(i) {
+  let where;
+  if (i.status === "running") {
+    where = PHASE_LABELS[i.phase] || i.phase || "démarrage";
+    if (i.phase === "inference" && i.total_steps) where += ` ${i.step || 0}/${i.total_steps}`;
+    where += ` · encore ${fmtDuration(i.remaining_s)}`;
+  } else {
+    where = `commence dans ${fmtDuration(i.starts_in_s)} · dure ~${fmtDuration(i.remaining_s)}`;
+  }
+  return h("li", { class: `task ${i.status}` }, taskThumb(i),
+    h("div", { class: "task-text" },
+      h("a", { href: taskHref(i) }, i.job_title || `Projet ${i.job_id}`), h("div", {}, taskWhat(i)),
+      i.status === "running" ? h("div", { class: "bar" }, h("div", { style: `width:${Math.max(2, taskPercent(i))}%` })) : null,
+      h("div", { class: "muted small" }, where)),
+    h("button", { type: "button", class: "danger", title: "Annuler cette tâche",
+      onclick: () => act(() => api("POST", `/${KIND_PATHS[i.kind]}/${i.id}/cancel`)) }, "Annuler"));
+}
+
+function renderRecentRow(i) {
+  return h("li", { class: `task ${i.status}` }, taskThumb(i),
+    h("div", { class: "task-text" },
+      h("a", { href: taskHref(i) }, i.job_title || `Projet ${i.job_id}`), h("div", {}, taskWhat(i)),
+      h("div", { class: "muted small" }, i.status === "done" ? h("span", { class: "ok-text" }, "terminé") : badge(i.status),
+        ` ${fmtAgo(i.finished_at)}`)));
+}
 
 function renderQueuePanel() {
   const panel = document.getElementById("queue-panel");
-  const w = state.queue.worker;
-  const rows = state.queue.items.map((i) => {
-    const what = i.kind === "take"
-      ? `plan ${i.segment_idx + 1} · ${TIER_LABELS[i.tier] || i.tier} (prise #${i.id})`
-      : i.kind === "keygen" ? `création de l'${posName(i.position)} (#${i.id})`
-        : i.kind === "review" ? `relecture IA du prompt ${i.target === "motion" ? `du plan ${i.segment_idx + 1}` : "d'image"}`
-          : `montage ${i.id}`;
-    let where = "";
-    if (i.status === "running") {
-      where = PHASE_LABELS[i.phase] || i.phase || "démarrage";
-      if (i.phase === "inference" && i.total_steps) where += ` ${i.step || 0}/${i.total_steps}`;
-      where += ` · encore ${fmtDuration(i.remaining_s)}`;
-    } else {
-      where = `commence dans ${fmtDuration(i.starts_in_s)} · dure ~${fmtDuration(i.remaining_s)}`;
-    }
-    return h("li", { class: i.status },
-      h("a", { href: `#/job/${i.job_id}` }, `projet ${i.job_id}`), " · ", what, h("div", { class: "muted" }, where));
-  });
+  const q = state.queue;
+  const w = q.worker;
+  // Rebuilt only when what it shows changes (a button pressed during a rebuild would be lost).
+  const sig = JSON.stringify([w.alive, w.loaded_model, q.items.map((i) => [i.kind, i.id, i.status, i.phase, i.step,
+    Math.round(i.starts_in_s / 10), Math.round(i.remaining_s / 10)]), (q.recent || []).map((i) => [i.id, i.kind, i.status]),
+  Math.floor(Date.now() / 60000)]);
+  if (panel.dataset.sig === sig) return;
+  panel.dataset.sig = sig;
   const top = panel.scrollTop; // emptying the panel would scroll it back to the top
-  panel.replaceChildren(
+  panel.replaceChildren(...[
     h("h3", {}, "File d'attente"),
-    h("p", { class: "muted" },
+    h("p", { class: "muted small" },
       w.alive
         ? `Moteur de rendu actif (pid ${w.pid}), modèle chargé : ${w.loaded_model || "aucun"}` +
           (w.loaded_model ? ` (profil ${w.loaded_profile})` : "")
         : "Moteur de rendu arrêté : lance scripts\\start-worker.ps1."),
-    rows.length ? h("ol", {}, rows) : h("p", {}, "Rien en attente."),
-    rows.length ? h("p", { class: "muted" }, `Tout sera fini dans ${fmtDuration(state.queue.total_s)} environ.`) : null,
-    h("p", { class: "muted small" },
-      "Ordre : les relectures de prompt, puis les aperçus et les images créées, puis les montages, puis les rendus finaux regroupés par modèle " +
-      "(changer de modèle le recharge). Tu peux fermer la page : les rendus continuent."),
-  );
+    q.items.length ? h("ol", { class: "tasks" }, q.items.map(renderQueueRow)) : h("p", {}, "Rien en attente."),
+    q.items.length ? h("p", { class: "muted" }, `Tout sera fini dans ${fmtDuration(q.total_s)} environ.`) : null,
+    q.recent?.length ? [h("h3", { class: "recent-title" }, "Terminé récemment"),
+      h("ol", { class: "tasks recent" }, q.recent.map(renderRecentRow))] : null,
+    fold("queue-order", "adv", "Dans quel ordre ?", h("p", { class: "muted small" },
+      "Les relectures de prompt, puis les aperçus et les images créées, puis les montages, puis les rendus finaux " +
+      "regroupés par modèle (changer de modèle le recharge). Tu peux fermer la page : les rendus continuent.")),
+  ].flat().filter(Boolean));
   panel.scrollTop = top;
 }
 
 // --- jobs list ----------------------------------------------------------------------------------
 
+// The projects, most recently active first (the API sorts them). A card says where the project
+// stands (what to do, what runs, a finished video) and holds the « ⋯ » menu to delete it.
+
 function renderJobs(jobs) {
   const app = document.getElementById("app");
   if (!app.querySelector(".jobs-view")) {
     const finals = state.presets.filter((p) => p.tier === "final");
-    const form = h("form", { class: "card new-job", onsubmit: createJob },
-      h("h2", {}, "Nouveau projet"),
+    const form = h("form", { class: "card new-job", hidden: true, onsubmit: createJob },
       h("label", {}, "Titre", h("input", { name: "title", placeholder: "ex. port à l'aquarelle, bateaux qui tanguent" })),
       advanced("new-job",
         h("label", {}, "Modèle du rendu final",
           h("select", { name: "preset_final" },
             finals.map((p) => h("option", { value: p.name, selected: p.name === "final-14b" }, p.label)))),
         h("label", {}, "Fin du dernier plan (si tu ajoutes une image de fin)", endModeSelect("exact"))),
-      h("button", { type: "submit", class: "primary" }, "Créer"),
+      h("div", { class: "row" }, h("button", { type: "submit", class: "primary" }, "Créer"),
+        h("button", { type: "button", onclick: () => toggleNewJob(false) }, "Annuler")),
     );
     app.replaceChildren(h("section", { class: "jobs-view" },
-      h("div", { class: "jobs-side" }, form, howItWorks()),
-      h("div", {}, h("h2", { class: "first" }, "Mes projets"), h("div", { class: "job-grid" }))));
+      h("div", { class: "jobs-head" },
+        h("h2", {}, "Mes projets"), h("span", { class: "muted jobs-count" }), h("span", { class: "spacer" }),
+        h("button", { type: "button", class: "primary new-job-button", onclick: () => toggleNewJob(true) },
+          "+ Nouveau projet")),
+      form,
+      h("div", { class: "job-grid" }),
+      h("div", { class: "how-box" })));
   }
+  const total = jobs.reduce((n, j) => n + j.disk_bytes, 0);
+  app.querySelector(".jobs-count").textContent = jobs.length
+    ? `${jobs.length} projet${jobs.length > 1 ? "s" : ""} · ${fmtBytes(total)} sur le disque` : "";
   const grid = app.querySelector(".job-grid");
-  syncList(grid, jobs, (j) => j.id, (j) => JSON.stringify(j), (j) =>
-    h("a", { class: "card job-card", href: `#/job/${j.id}` },
+  syncList(grid, jobs, (j) => j.id, (j) => JSON.stringify([j, Math.floor(Date.now() / 60000)]), renderJobCard);
+  if (!jobs.length) {
+    grid.replaceChildren(h("p", { class: "muted" }, "Aucun projet pour l'instant : crée le premier."));
+    toggleNewJob(true);
+  }
+  // The help: open when there is no project yet, a fold under the cards afterwards.
+  const how = app.querySelector(".how-box");
+  if (how.dataset.sig !== String(jobs.length > 0)) {
+    how.dataset.sig = String(jobs.length > 0);
+    how.replaceChildren(jobs.length ? fold("how", "adv how-fold", "Comment ça marche", howItWorks()) : howItWorks());
+  }
+}
+
+function toggleNewJob(open) {
+  const form = document.querySelector(".new-job");
+  if (!form) return;
+  form.hidden = !open;
+  document.querySelector(".new-job-button").hidden = open;
+  if (open) form.querySelector("input[name=title]").focus();
+}
+
+// Where a project stands, from the list summary: [text, class].
+function jobTodo(j) {
+  if (j.running) return [`rendu en cours${j.queued ? `, ${j.queued} en file` : ""}`, "live"];
+  if (j.queued) return [`${j.queued} rendu${j.queued > 1 ? "s" : ""} en file`, "queued"];
+  if (!j.keyframes) return ["à faire : déposer l'image de départ", ""];
+  if (j.status === "failed") return ["dernière prise en échec", "bad"];
+  if (j.video_url) return ["vidéo prête", "ok"];
+  if (j.segments && j.retained === j.segments) return ["à faire : monter la vidéo", ""];
+  if (!j.takes_done) return ["à faire : un premier aperçu", ""];
+  return [`à faire : garder une prise par plan (${j.retained}/${j.segments})`, ""];
+}
+
+function renderJobCard(j) {
+  const [todo, cls] = jobTodo(j);
+  const name = j.title || `Projet ${j.id}`;
+  const menu = h("div", { class: "card-menu", hidden: true },
+    h("button", { type: "button", class: "danger", onclick: () => deleteJob(j) }, "Supprimer le projet…"));
+  return h("div", { class: "card job-card" },
+    h("a", { href: `#/job/${j.id}`, class: "job-card-link" },
       j.thumbnail_url ? h("img", { src: j.thumbnail_url, alt: "" }) : h("div", { class: "no-thumb" }, "pas d'image"),
       h("div", { class: "job-card-body" },
-        h("strong", {}, j.title || `Projet ${j.id}`),
-        h("div", {}, badge(j.status), " ", h("span", { class: "muted" }, fmtDate(j.created_at))),
-      )));
-  if (!jobs.length) grid.replaceChildren(h("p", { class: "muted" }, "Aucun projet pour l'instant : crée le premier à gauche."));
+        h("strong", {}, name),
+        h("div", { class: `job-todo ${cls}` }, todo),
+        h("div", { class: "muted small" },
+          [j.segments ? `${j.segments} plan${j.segments > 1 ? "s" : ""}` : null,
+            j.takes ? `${j.takes} prise${j.takes > 1 ? "s" : ""}` : null,
+            fmtBytes(j.disk_bytes), fmtAgo(j.updated_at)].filter(Boolean).join(" · ")))),
+    h("button", { type: "button", class: "card-menu-button", title: "Plus d'actions",
+      onclick: (ev) => { ev.stopPropagation(); closeMenus(menu); menu.hidden = !menu.hidden; } }, "⋯"),
+    menu);
+}
+
+function closeMenus(except) {
+  for (const m of document.querySelectorAll(".card-menu")) if (m !== except) m.hidden = true;
+}
+document.addEventListener("click", () => closeMenus(null));
+
+async function deleteJob(j) {
+  closeMenus(null);
+  const name = j.title || `Projet ${j.id}`;
+  if (j.running || j.queued) {
+    toast(`« ${name} » a des rendus en file ou en cours : annule-les d'abord (file d'attente, en haut).`);
+    return false;
+  }
+  if (!confirm(`Supprimer « ${name} » ? Ses images, ses prises et ses vidéos (${fmtBytes(j.disk_bytes)}) sont ` +
+    "effacées du disque. C'est définitif.")) return false;
+  const r = await act(() => api("DELETE", `/jobs/${j.id}`), { refresh: state.route.name === "jobs" });
+  if (r) toast(`Projet supprimé, ${fmtBytes(r.freed_bytes)} libérés.`, false);
+  return Boolean(r);
 }
 
 function howItWorks() {
@@ -597,6 +748,15 @@ function renderJob() {
     })]), renderAssembly);
   view.querySelector("#step-shots").classList.toggle("locked", !job.keyframes.length);
   highlightNext(next.target);
+  if (state.route.focus) {
+    const el = document.querySelector(`[data-next="${state.route.focus}"]`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.classList.add("flash");
+      setTimeout(() => el.classList.remove("flash"), 2000);
+    }
+    state.route.focus = null;
+  }
 }
 
 function kfVersions(job, s) {
@@ -624,7 +784,13 @@ function renderJobHead(job) {
         job.end_mode === "guide"
           ? "Indicative : le rendu final du dernier plan part de son image de départ seule et le prompt mène la " +
             "fin ; l'image de fin sert seulement à juger l'aperçu. Les plans du milieu arrivent toujours sur leur image."
-          : "Exacte : le rendu final de chaque plan arrive exactement sur son image de fin (modèle 14B).")),
+          : "Exacte : le rendu final de chaque plan arrive exactement sur son image de fin (modèle 14B)."),
+      h("div", { class: "row" }, h("button", { type: "button", class: "danger", onclick: async () => {
+        const live = state.queue.items.filter((i) => i.job_id === job.id);
+        const summary = (await api("GET", "/jobs").catch(() => [])).find((j) => j.id === job.id) ||
+          { ...job, running: live.length, queued: 0, disk_bytes: 0 };
+        if (await deleteJob(summary)) location.hash = "#/";
+      } }, "Supprimer le projet…"))),
   ];
 }
 
@@ -1202,7 +1368,12 @@ function renderKeygen(job, g) {
         ? h("button", { type: "button", title: `Remet cette image comme ${posName(g.position)}`,
           onclick: () => useKeygen(job, g) }, "Utiliser celle-ci") : null,
       h("button", { type: "button", title: "Mêmes images source et même prompt, autre tirage (graine)", onclick: again },
-        "Autre tirage")]);
+        "Autre tirage"),
+      h("button", { type: "button", class: "danger", disabled: current,
+        title: current ? `C'est l'${posName(g.position)} actuelle : remplace-la d'abord pour pouvoir la supprimer`
+          : "Supprimer cette création et ses fichiers",
+        onclick: () => deleteThing(`/keygens/${g.id}`, `Supprimer la création #${g.id} ? Ses images sont effacées du disque.`,
+          "Création supprimée") }, "Supprimer")]);
   const body = [g.instruction
     ? h("p", { class: "keygen-instruction" }, `« ${g.instruction} »`)
     : h("p", { class: "keygen-instruction muted" }, "sans prompt")];
@@ -1476,8 +1647,13 @@ function renderTake(job, s, t) {
     isLive(t)
       ? h("button", { type: "button", class: "danger", onclick: () => act(() => api("POST", `/takes/${t.id}/cancel`)) },
         t.cancel_requested ? "annulation…" : "Annuler")
-      : h("button", { type: "button", title: "Une nouvelle prise avec exactement les mêmes réglages, graine comprise",
+      : [h("button", { type: "button", title: "Une nouvelle prise avec exactement les mêmes réglages, graine comprise",
         onclick: () => act(() => api("POST", `/takes/${t.id}/replay`)) }, "Refaire à l'identique"),
+      h("button", { type: "button", class: "danger", title: "Supprimer cette prise et sa vidéo du disque",
+        onclick: () => deleteThing(`/takes/${t.id}`, retained
+          ? `La prise #${t.id} est gardée pour le montage. La supprimer quand même ? Le plan n'aura plus de prise ` +
+            "gardée ; les vidéos déjà montées restent."
+          : `Supprimer la prise #${t.id} ? Sa vidéo est effacée du disque.`, "Prise supprimée") }, "Supprimer")],
   );
   const body = [];
   if (t.status === "queued") {
@@ -1633,7 +1809,10 @@ function renderAssembly(job) {
         h("span", { class: "spacer" }),
         isLive(a)
           ? h("button", { type: "button", class: "danger",
-            onclick: () => act(() => api("POST", `/assemblies/${a.id}/cancel`)) }, "Annuler") : null),
+            onclick: () => act(() => api("POST", `/assemblies/${a.id}/cancel`)) }, "Annuler")
+          : h("button", { type: "button", class: "danger", title: "Supprimer ce montage et sa vidéo du disque",
+            onclick: () => deleteThing(`/assemblies/${a.id}`, `Supprimer le montage ${a.id} ? Sa vidéo est effacée ` +
+              "du disque (les prises restent : tu peux remonter).", "Montage supprimé") }, "Supprimer")),
       a.status === "running" ? h("p", {}, a.phase || "démarrage", q ? ` · encore ${fmtDuration(q.remaining_s)} environ` : "") : null,
       a.status === "queued" && q ? h("p", { class: "muted" }, `Commence dans ${fmtDuration(q.starts_in_s)} environ.`) : null,
       a.status === "failed" ? h("pre", { class: "error" }, a.error) : null,

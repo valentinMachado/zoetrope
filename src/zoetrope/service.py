@@ -15,6 +15,8 @@ removing in the middle" below); `cut_gesture` uses that to give a fine gesture (
 segment towards an image of it made by Klein (P14-P15).
 A prompt being written gets the instant rules of zoetrope.prompt_review (`check_prompt`) and, on
 request, an AI review queued for the worker (`create_review`), given its context as text.
+Jobs, takes, keygens and assemblies are deleted with their files, never while queued or running
+(see "deleting" below).
 """
 
 from __future__ import annotations
@@ -101,12 +103,47 @@ def _check_end_mode(mode: str) -> None:
 
 
 def list_jobs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    jobs = db.rows(conn.execute("SELECT * FROM job ORDER BY id DESC").fetchall())
+    """Every job with a summary for the projects page, the most recently active first: counts of
+    images, shots, retained takes and takes, its tasks in the queue, its last finished video and its
+    size on disk."""
+    jobs = db.rows(conn.execute("SELECT * FROM job").fetchall())
     for j in jobs:
-        j["status"] = job_status(conn, j["id"])
-        kf = conn.execute("SELECT file FROM keyframe WHERE job_id = ? AND position = 0", (j["id"],)).fetchone()
+        jid = j["id"]
+        j["status"] = job_status(conn, jid)
+        kf = conn.execute("SELECT file FROM keyframe WHERE job_id = ? AND position = 0", (jid,)).fetchone()
         j["thumbnail_url"] = paths.to_url(kf[0]) if kf else None
+        j["keyframes"] = _kf_count(conn, jid)
+        j["segments"], j["retained"] = conn.execute(
+            "SELECT COUNT(*), COUNT(retained_take_id) FROM segment WHERE job_id = ?", (jid,)).fetchone()
+        j["takes"], j["takes_done"] = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(t.status = 'done'), 0) FROM take t JOIN segment s ON s.id = t.segment_id "
+            "WHERE s.job_id = ?", (jid,)).fetchone()
+        live = _live_tasks(conn, jid)
+        j["running"], j["queued"] = live.count("running"), live.count("queued")
+        video = conn.execute("SELECT file FROM assembly WHERE job_id = ? AND status = 'done' ORDER BY id DESC LIMIT 1",
+                             (jid,)).fetchone()
+        j["video_url"] = paths.to_url(video[0]) if video else None
+        j["updated_at"] = _last_activity(conn, j)
+        j["disk_bytes"] = _tree_size(paths.job_dir(jid))
+    jobs.sort(key=lambda j: j["updated_at"], reverse=True)
     return jobs
+
+
+def _last_activity(conn: sqlite3.Connection, job: dict[str, Any]) -> float:
+    """The latest creation or end of anything in the job."""
+    jid = job["id"]
+    times = conn.execute(
+        "SELECT MAX(created_at) FROM keyframe WHERE job_id = ? "
+        "UNION ALL SELECT MAX(MAX(t.created_at, COALESCE(t.finished_at, 0))) FROM take t "
+        "JOIN segment s ON s.id = t.segment_id WHERE s.job_id = ? "
+        "UNION ALL SELECT MAX(MAX(created_at, COALESCE(finished_at, 0))) FROM keygen WHERE job_id = ? "
+        "UNION ALL SELECT MAX(MAX(created_at, COALESCE(finished_at, 0))) FROM assembly WHERE job_id = ?",
+        (jid, jid, jid, jid)).fetchall()
+    return max([job["created_at"], *(t[0] for t in times if t[0])])
+
+
+def _tree_size(folder: Path) -> int:
+    return sum(f.stat().st_size for f in folder.rglob("*") if f.is_file()) if folder.is_dir() else 0
 
 
 def job_status(conn: sqlite3.Connection, job_id: int) -> str:
@@ -389,9 +426,14 @@ def delete_keyframe(conn: sqlite3.Connection, keyframe_id: int) -> None:
     job_id, p = k["job_id"], k["position"]
     last = conn.execute("SELECT MAX(position) FROM keyframe WHERE job_id = ?", (job_id,)).fetchone()[0]
     if p == last:
+        if conn.execute("SELECT 1 FROM keygen WHERE job_id = ? AND position = ? AND status IN ('queued', 'running')",
+                        (job_id, p)).fetchone():
+            raise Invalid(f"An image is being created for image {p}: cancel it first")
         with db.transaction(conn):
             conn.execute("DELETE FROM keyframe WHERE id = ?", (keyframe_id,))
+            conn.execute("UPDATE keygen SET position = -1 WHERE job_id = ? AND position = ?", (job_id, p))
             _sync_segments(conn, job_id)
+        _remove_files([Path(k["orig_file"]), Path(k["file"])])
         return
     if p == 0:
         raise Invalid("The start image cannot be removed while other images follow it: replace it instead")
@@ -859,6 +901,94 @@ def create_assembly(conn: sqlite3.Connection, job_id: int, *, color_match: bool 
     return public_assembly(_get(conn, "assembly", cur.lastrowid))
 
 
+# --- deleting -----------------------------------------------------------------------------------
+#
+# Rows and their files go together. Nothing queued or running is deleted (cancel it first): the
+# worker would write into a folder that is gone. A take is deleted even when it is retained (the
+# front asks first): its shot then has no retained take. An image created by Klein is kept while it
+# is the current image at its position. Each deletion returns the bytes freed on disk.
+
+
+def _live_tasks(conn: sqlite3.Connection, job_id: int) -> list[str]:
+    """Statuses of the job's queued or running tasks."""
+    return [r[0] for r in conn.execute(
+        "SELECT t.status FROM take t JOIN segment s ON s.id = t.segment_id WHERE s.job_id = ? "
+        "AND t.status IN ('queued', 'running') "
+        "UNION ALL SELECT status FROM keygen WHERE job_id = ? AND status IN ('queued', 'running') "
+        "UNION ALL SELECT status FROM assembly WHERE job_id = ? AND status IN ('queued', 'running') "
+        "UNION ALL SELECT status FROM review WHERE job_id = ? AND status IN ('queued', 'running')",
+        (job_id, job_id, job_id, job_id)).fetchall()]
+
+
+def _remove_files(files: list[Path]) -> int:
+    """Delete the files that exist; one held open by a reader (Windows) stays. Bytes freed."""
+    freed = 0
+    for f in files:
+        try:
+            size = f.stat().st_size
+            f.unlink()
+            freed += size
+        except OSError:
+            pass
+    return freed
+
+
+def _task_files(folder: Path, row_id: int) -> list[Path]:
+    """A task's files in its folder: `<id>.<ext>` and `<id>_<name>` (inputs, preview, log)."""
+    return [*folder.glob(f"{row_id}.*"), *folder.glob(f"{row_id}_*")]
+
+
+def _refuse_live(r: dict[str, Any], what: str) -> None:
+    if r["status"] in ("queued", "running"):
+        raise Invalid(f"{what} is {r['status']}: cancel it first")
+
+
+def delete_job(conn: sqlite3.Connection, job_id: int) -> dict[str, int]:
+    _get(conn, "job", job_id)
+    if _live_tasks(conn, job_id):
+        raise Invalid(f"Job {job_id} has tasks queued or running: cancel them first")
+    folder = paths.job_dir(job_id)
+    size = _tree_size(folder)
+    conn.execute("DELETE FROM job WHERE id = ?", (job_id,))  # the rest goes by ON DELETE CASCADE
+    shutil.rmtree(folder, ignore_errors=True)
+    return {"freed_bytes": size - _tree_size(folder)}
+
+
+def delete_take(conn: sqlite3.Connection, take_id: int) -> dict[str, int]:
+    t = _get(conn, "take", take_id)
+    _refuse_live(t, f"Take {take_id}")
+    seg = _get(conn, "segment", t["segment_id"])
+    for (ids,) in conn.execute("SELECT take_ids FROM assembly WHERE job_id = ? AND status IN ('queued', 'running')",
+                               (seg["job_id"],)).fetchall():
+        if take_id in db.loads(ids, []):
+            raise Invalid(f"Take {take_id} is being assembled: cancel the assembly first")
+    with db.transaction(conn):
+        conn.execute("UPDATE segment SET retained_take_id = NULL WHERE retained_take_id = ?", (take_id,))
+        conn.execute("DELETE FROM take WHERE id = ?", (take_id,))
+    # A replayed take reads its inputs from the take it copied: those stay while another take uses them.
+    used = {v for (st,) in conn.execute("SELECT t.settings FROM take t JOIN segment s ON s.id = t.segment_id "
+                                        "WHERE s.job_id = ?", (seg["job_id"],)).fetchall()
+            for v in db.loads(st, {}).values() if isinstance(v, str)}
+    files = _task_files(paths.takes_dir(seg["job_id"]), take_id)
+    return {"freed_bytes": _remove_files([f for f in files if str(f) not in used])}
+
+
+def delete_keygen(conn: sqlite3.Connection, gen_id: int) -> dict[str, int]:
+    g = _get(conn, "keygen", gen_id)
+    _refuse_live(g, f"Keygen {gen_id}")
+    if conn.execute("SELECT 1 FROM keyframe WHERE source_keygen_id = ?", (gen_id,)).fetchone():
+        raise Invalid(f"Keygen {gen_id} made the current image at position {g['position']}: replace it first")
+    conn.execute("DELETE FROM keygen WHERE id = ?", (gen_id,))
+    return {"freed_bytes": _remove_files(_task_files(paths.keygens_dir(g["job_id"]), gen_id))}
+
+
+def delete_assembly(conn: sqlite3.Connection, assembly_id: int) -> dict[str, int]:
+    a = _get(conn, "assembly", assembly_id)
+    _refuse_live(a, f"Assembly {assembly_id}")
+    conn.execute("DELETE FROM assembly WHERE id = ?", (assembly_id,))
+    return {"freed_bytes": _remove_files(_task_files(paths.assembly_dir(a["job_id"]), assembly_id))}
+
+
 def public_assembly(a: dict[str, Any]) -> dict[str, Any]:
     a = dict(a)
     a["take_ids"] = db.loads(a["take_ids"], [])
@@ -898,4 +1028,45 @@ def queue_state(conn: sqlite3.Connection) -> dict[str, Any]:
             item.update(job_id=r["job_id"], target=r["target"], segment_idx=idx, phase=r["phase"])
         else:
             item.update(job_id=r["job_id"], phase=r["phase"])
-    return {"worker": worker_state(conn), **snap}
+        item.update(_task_card(conn, item["kind"], r, item["job_id"]))
+    return {"worker": worker_state(conn), **snap, "recent": recent_tasks(conn)}
+
+
+RECENT_TASKS = 10
+
+
+def _task_card(conn: sqlite3.Connection, kind: str, r: dict[str, Any], job_id: int) -> dict[str, Any]:
+    """What the queue panel shows of a task besides its state: the job's title and a thumbnail
+    (the take's start image, the keygen's first source, else the job's start image)."""
+    title = conn.execute("SELECT title FROM job WHERE id = ?", (job_id,)).fetchone()
+    thumb = None
+    if kind == "take":
+        thumb = db.loads(r["settings"], {}).get("image_start")
+    elif kind == "keygen":
+        thumb = r["output_file"] or next((s["file"] for s in _keygen_sources(r)), None)
+    if not thumb or not Path(thumb).is_file():
+        kf = conn.execute("SELECT file FROM keyframe WHERE job_id = ? AND position = 0", (job_id,)).fetchone()
+        thumb = kf[0] if kf else None
+    return {"job_title": title[0] if title else "", "thumb_url": paths.to_url(thumb) if thumb else None}
+
+
+def recent_tasks(conn: sqlite3.Connection, limit: int = RECENT_TASKS) -> list[dict[str, Any]]:
+    """The last takes, keygens and assemblies that ended (done or failed), the latest first: what
+    happened while the user was away."""
+    rows = conn.execute(
+        "SELECT 'take', t.id, s.job_id, t.finished_at FROM take t JOIN segment s ON s.id = t.segment_id "
+        "WHERE t.status IN ('done', 'failed') "
+        "UNION ALL SELECT 'keygen', id, job_id, finished_at FROM keygen WHERE status IN ('done', 'failed') "
+        "UNION ALL SELECT 'assembly', id, job_id, finished_at FROM assembly WHERE status IN ('done', 'failed') "
+        "ORDER BY 4 DESC LIMIT ?", (limit,)).fetchall()
+    out = []
+    for kind, rid, job_id, finished in rows:
+        r = _get(conn, kind, rid)
+        item = {"kind": kind, "id": rid, "job_id": job_id, "status": r["status"], "finished_at": finished}
+        if kind == "take":
+            item.update(tier=r["tier"], segment_idx=_get(conn, "segment", r["segment_id"])["idx"])
+        elif kind == "keygen":
+            item.update(tier="keyframe", position=r["position"])
+        item.update(_task_card(conn, kind, r, job_id))
+        out.append(item)
+    return out
