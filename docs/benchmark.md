@@ -429,7 +429,7 @@ load).
   photorealistic face under the paint; a butterfly from the prompt comes out photorealistic.
 - **LoRA**: none for a watercolour style exists for Wan (5B or 14B I2V) on Civitai or Hugging Face
   (searched by base model; the only 5B I2V "splash" LoRA is a water-balloon effect). The brief's
-  next step would be training one (style LoRA on stills, not doable on this GPU).
+  next step would be training one (measured in P16: "Training a style LoRA" below).
 
 **A painted end image bounds it.** Through Zoetrope, on job 4 (project style set, prompt "She
 slowly smiles, then winks. Static camera.", 2.5 s): end keyframe created by Klein from the start
@@ -546,6 +546,57 @@ in all. The end image guarantees the gesture at the end of the shot; in between,
 close both eyes. Whether #16 owed it to its wink image (keygen #6) or to chance is not isolated.
 The front says so: several takes per gesture shot, keep the best.
 
+## Training a style LoRA (P16)
+
+Can this machine train a watercolour style LoRA? Trainer: **musubi-tuner** (kohya-ss, v0.3.6,
+commit `f8a1b03`) in `tools/musubi-tuner/`, own venv (Python 3.10, torch 2.7.1+cu126,
+bitsandbytes 0.50.2, whose 8-bit AdamW runs on Pascal). It trains FLUX.2 Klein and Wan 2.2 14B,
+not the Wan 2.2 5B (no config for it).
+
+**Precision.** Matmul throughput measured on the GTX 1080 (4096², torch 2.7.1): fp32 6.7 TFLOPS,
+**fp16 7.3** (cuBLAS computes in fp32), bf16 3.8. The trainers offer fp16 or bf16 only
+(`--mixed_precision`); weights are stored fp8 (`--fp8_base --fp8_scaled`, a storage format,
+upcast per layer, so no fp8 hardware needed).
+
+**Data.** 14 watercolour Christmas cards supplied by the user (ink outlines, textured paper,
+white ground; a few are photos of a card on a table), one caption each written by hand
+(content only) behind the trigger `zoewc watercolor illustration,`. 512² buckets. Files in
+`outputs/lora/aquarelle-noel/` (not tracked).
+
+| Run (10 steps, LoRA rank 16, batch 1, gradient checkpointing) | Per step | VRAM peak | RAM peak | Loss |
+| --- | --- | --- | --- | --- |
+| Klein base 4B, fp16 | 11.7 s | 6.1 GB | +2 GB | **NaN** from step 1 |
+| **Klein base 4B, bf16** | **14.3 s** | 6.6 GB | +2 GB | 0.65, stable |
+| 14B I2V low-noise expert, fp16, 32 blocks swapped | 27 s | 7.8 GB | 24.6 GB | 0.005 |
+
+VRAM peaks include ~0.9 GB held by the desktop; the RAM figure for Klein is what training added.
+
+- **Klein** needs the *base* (undistilled) weights: `flux-2-klein-base-4b.safetensors`
+  (7.75 GB, bf16) and Qwen3 4B in bf16 (two files, 8 GB), in `models/klein-base-4b/`; the
+  existing `models/flux2_vae.safetensors` serves as the VAE. Caching the 14 captions with Qwen3
+  in bf16 took 20 s each (5 min 47 s), the latents 16 s. fp16 overflows (NaN loss); bf16 costs
+  only ~20 % more. A LoRA trained on the base applies as is to Wan2GP's distilled int8 Klein
+  (`activated_loras`, no key conversion: Wan2GP maps musubi's `lora_unet_*` names).
+- **14B**: measured without a download, on the low-noise expert of the Lightning checkpoint the
+  tool renders with, dequantized from fp8 "scaled" (which musubi does not load) to fp16
+  (28.6 GB, written to `C:\zoetrope-train\` by a streaming script, 7 min); text embeddings were
+  random (timing only). 1000 steps ≈ 7 h 30. **But the loss shows the catch**: on an I2V model a
+  still image is both the conditioning first frame and the target, so the model mostly learns to
+  copy it. A style LoRA for the 14B I2V has to be trained on clips. **On clips it does not fit**:
+  the 14 stills panned or zoomed slowly (17 frames, 480x640, `outputs/lora/aquarelle-noel/clips/`;
+  caching their latents alone took 30 min, 2 min 7 s per clip) run at **~11 min for the first step,
+  over 13 min for the second**, VRAM full (7.97 GB, spilling into shared memory), RAM 25.9 GB:
+  1000 steps would take over a week. With 32 blocks swapped no step finished in 28 min; 39
+  (the maximum) crashes musubi (tensors on both devices); 38 with `--force_v2_1_time_embedding` is
+  the run above. Smaller clips (9 frames, ~320x416) were not tried.
+- **Long runs**: Windows went to sleep during the first full Klein run (10 h 30 lost, the run
+  resumed on wake). A run must keep the system awake (`SetThreadExecutionState`) and save a
+  resumable state (`--save_state`, then `--resume`).
+
+**Klein, full run.** 1500 steps (lr 1e-4, rank 16, alpha 16) ≈ 5 h 45 at 13.7 s/step. The first
+run stopped at step 298 (checkpoint 250 kept); the rest is scheduled from that checkpoint.
+Quality: not yet measured.
+
 ## Recommendation
 
 **5B for previews.** It fits comfortably (5.7 GB VRAM, 24 GB RAM). FastWan (3 steps): 4 min
@@ -568,7 +619,8 @@ source images, the start image as a possible target).
 
 **Painted images**: the 14B keeps a watercolour, FastWan does not (cut at frame 4); an end
 image made by Klein from the start keeps it through the whole move (section above). No style
-LoRA exists for Wan; training one is the brief's last resort.
+LoRA exists for Wan. Training one (P16, section above): Klein base fits (bf16, 14 s per step);
+the 14B I2V needs clips, and on 17-frame clips a step takes over 11 min: not on this machine.
 
 **Fine gestures** (a wink): text alone does not get them from the 14B Lightning, whatever the
 wording or the length; a keyframe of the gesture made by Klein and one segment per gesture
